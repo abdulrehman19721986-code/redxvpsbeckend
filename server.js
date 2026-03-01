@@ -5,7 +5,7 @@ const axios = require('axios');
 const pm2 = require('pm2');
 const fs = require('fs');
 const path = require('path');
-const { exec } = require('child_process');
+const { execa } = require('execa'); // npm install execa
 require('dotenv').config();
 
 const app = express();
@@ -15,12 +15,12 @@ app.use(express.static(path.join(__dirname, 'public'))); // serve frontend
 
 // Environment
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'redx';
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN; // optional, for higher rate limits
 const BOTS_DIR = path.join(__dirname, 'bots');
-const MAIN_REPO = 'https://github.com/AbdulRehman19721986/redxbot302.git';
+const MAIN_REPO = process.env.MAIN_REPO || 'https://github.com/AbdulRehman19721986/redxbot302.git';
 
 // Ensure bots directory exists
-if (!fs.existsSync(BOTS_DIR)) fs.mkdirSync(BOTS_DIR);
+if (!fs.existsSync(BOTS_DIR)) fs.mkdirSync(BOTS_DIR, { recursive: true });
 
 // PostgreSQL connection
 const pool = new Pool({
@@ -64,12 +64,24 @@ async function initDb() {
       status TEXT DEFAULT 'online'
     );
   `);
+
   // Insert default server (this Railway instance)
   await pool.query(
     `INSERT INTO servers (name, url, api_key, bot_count) 
      VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING`,
     ['Railway Main', 'http://localhost', 'internal', 0]
   );
+
+  // Insert default plans if none exist
+  const { rows } = await pool.query('SELECT COUNT(*) FROM plans');
+  if (parseInt(rows[0].count) === 0) {
+    await pool.query(
+      `INSERT INTO plans (name, price, duration, max_bots, features) VALUES 
+       ('Free', 'Free', 'Lifetime', 1, ARRAY['1 Bot', 'Basic Support']),
+       ('Pro', '$5/month', '30 days', 3, ARRAY['3 Bots', 'Priority Support', 'Advanced Features']),
+       ('Premium', '$10/month', '30 days', 10, ARRAY['10 Bots', 'VIP Support', 'All Features'])`
+    );
+  }
 }
 initDb().catch(console.error);
 
@@ -78,12 +90,26 @@ async function checkFork(username) {
   try {
     const headers = GITHUB_TOKEN ? { Authorization: `token ${GITHUB_TOKEN}` } : {};
     const url = `https://api.github.com/repos/AbdulRehman19721986/redxbot302/forks?per_page=100`;
-    const resp = await axios.get(url, { headers });
+    const resp = await axios.get(url, { headers, timeout: 10000 });
     const forks = resp.data;
     const userFork = forks.find(fork => fork.owner.login.toLowerCase() === username.toLowerCase());
     return { hasFork: !!userFork, forkUrl: userFork?.html_url };
   } catch (e) {
+    console.error('GitHub API error:', e.message);
     return { hasFork: false, error: e.message };
+  }
+}
+
+// Clone user's fork using git
+async function cloneRepo(githubUsername, appName) {
+  const repoUrl = `https://github.com/${githubUsername}/redxbot302.git`;
+  const dest = path.join(BOTS_DIR, appName);
+  try {
+    await execa('git', ['clone', repoUrl, dest]);
+    return { success: true };
+  } catch (err) {
+    console.error('Clone failed:', err.message);
+    return { success: false, error: err.message };
   }
 }
 
@@ -153,42 +179,44 @@ app.post('/deploy', async (req, res) => {
   const botPath = path.join(BOTS_DIR, appName);
 
   // Clone the user's fork
-  const forkUrl = `https://github.com/${githubUsername}/redxbot302.git`;
-  exec(`git clone ${forkUrl} "${botPath}"`, async (err) => {
-    if (err) return res.status(500).json({ error: 'Clone failed', details: err.message });
+  const cloneResult = await cloneRepo(githubUsername, appName);
+  if (!cloneResult.success) {
+    return res.status(500).json({ error: 'Clone failed: ' + cloneResult.error });
+  }
 
-    // Create .env
-    const envContent = Object.entries({
-      SESSION_ID: sessionId,
-      GITHUB_USERNAME: githubUsername,
-      ...config
-    }).map(([k, v]) => `${k}=${v}`).join('\n');
-    fs.writeFileSync(path.join(botPath, '.env'), envContent);
+  // Create .env
+  const envContent = Object.entries({
+    SESSION_ID: sessionId,
+    GITHUB_USERNAME: githubUsername,
+    ...config
+  }).map(([k, v]) => `${k}=${v}`).join('\n');
+  fs.writeFileSync(path.join(botPath, '.env'), envContent);
 
-    // Install dependencies and start with PM2
-    exec(`cd "${botPath}" && npm install`, (err2) => {
-      if (err2) return res.status(500).json({ error: 'npm install failed' });
+  // Install dependencies and start with PM2
+  try {
+    await execa('npm', ['install'], { cwd: botPath });
+  } catch (err) {
+    return res.status(500).json({ error: 'npm install failed: ' + err.message });
+  }
 
-      pm2.connect((err3) => {
-        if (err3) return res.status(500).json({ error: 'PM2 connect failed' });
-        pm2.start({
-          script: 'index.js',
-          name: appName,
-          cwd: botPath,
-          env: process.env
-        }, async (err4, proc) => {
-          pm2.disconnect();
-          if (err4) return res.status(500).json({ error: 'PM2 start failed' });
+  pm2.connect((err) => {
+    if (err) return res.status(500).json({ error: 'PM2 connect failed' });
+    pm2.start({
+      script: 'index.js',
+      name: appName,
+      cwd: botPath,
+      env: process.env
+    }, async (err2, proc) => {
+      pm2.disconnect();
+      if (err2) return res.status(500).json({ error: 'PM2 start failed: ' + err2.message });
 
-          // Save to database
-          await pool.query(
-            'INSERT INTO bots (app_name, github_username) VALUES ($1, $2)',
-            [appName, githubUsername.toLowerCase()]
-          );
-          await pool.query('UPDATE servers SET bot_count = bot_count + 1 WHERE id = 1');
-          res.json({ success: true, appName });
-        });
-      });
+      // Save to database
+      await pool.query(
+        'INSERT INTO bots (app_name, github_username) VALUES ($1, $2)',
+        [appName, githubUsername.toLowerCase()]
+      );
+      await pool.query('UPDATE servers SET bot_count = bot_count + 1 WHERE id = 1');
+      res.json({ success: true, appName });
     });
   });
 });
@@ -233,8 +261,8 @@ app.post('/get-config', (req, res) => {
   const envFile = path.join(botPath, '.env');
   if (!fs.existsSync(envFile)) return res.status(404).json({ error: 'Config not found' });
   const env = fs.readFileSync(envFile, 'utf8').split('\n').reduce((acc, line) => {
-    const [key, val] = line.split('=');
-    if (key) acc[key] = val;
+    const [key, ...valArr] = line.split('=');
+    if (key) acc[key] = valArr.join('=');
     return acc;
   }, {});
   res.json({ success: true, config: env });
@@ -370,11 +398,11 @@ app.post('/delete-multiple-apps', async (req, res) => {
   res.json({ success: true, results });
 });
 
-// Buy plan – WhatsApp link generator
+// Buy plan – WhatsApp link generator (uses your number)
 app.post('/api/buy-plan', (req, res) => {
   const { planName, price, githubUsername } = req.body;
   const message = `I want to buy the ${planName} plan (${price}). My GitHub: ${githubUsername}`;
-  const whatsappLink = `https://wa.me/923346690239?text=${encodeURIComponent(message)}`;
+  const whatsappLink = `https://wa.me/923009842133?text=${encodeURIComponent(message)}`;
   res.json({ whatsappLink });
 });
 
