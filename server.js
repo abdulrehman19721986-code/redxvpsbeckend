@@ -2,10 +2,11 @@ const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
 const axios = require('axios');
-const fs = require('fs');
+const fs = require('fs').promises;
+const fsSync = require('fs');
 const path = require('path');
 const simpleGit = require('simple-git');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
 require('dotenv').config();
@@ -19,7 +20,7 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'redx';
 const BOTS_DIR = path.join(__dirname, 'bots');
 const MAIN_REPO = 'https://github.com/AbdulRehman19721986/redxbot302.git';
 
-if (!fs.existsSync(BOTS_DIR)) fs.mkdirSync(BOTS_DIR, { recursive: true });
+if (!fsSync.existsSync(BOTS_DIR)) fsSync.mkdirSync(BOTS_DIR, { recursive: true });
 
 // PostgreSQL connection
 const pool = new Pool({
@@ -69,14 +70,12 @@ async function initDb() {
     );
   `);
 
-  // Insert default server
   await pool.query(
     `INSERT INTO servers (name, url, api_key, bot_count) 
      VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING`,
     ['Railway Main', 'http://localhost', 'internal', 0]
   );
 
-  // Insert default plans if none exist
   const { rows } = await pool.query('SELECT COUNT(*) FROM plans');
   if (parseInt(rows[0].count) === 0) {
     await pool.query(
@@ -118,59 +117,137 @@ async function cloneRepo(githubUsername, appName) {
   }
 }
 
-// Start bot with PM2 and verify it's running
-async function startBotWithPM2(appName, botPath) {
-  // Check if package.json exists and find main script
+// Remove discard-api from package.json (recursive)
+async function fixPackageJson(botPath) {
   const pkgPath = path.join(botPath, 'package.json');
-  let mainScript = 'index.js';
-  if (fs.existsSync(pkgPath)) {
+  try {
+    await fs.access(pkgPath);
+  } catch {
+    return { success: false, error: 'package.json not found' };
+  }
+
+  try {
+    const content = await fs.readFile(pkgPath, 'utf8');
+    const pkg = JSON.parse(content);
+    let modified = false;
+
+    // Remove from dependencies
+    if (pkg.dependencies && pkg.dependencies['discard-api']) {
+      delete pkg.dependencies['discard-api'];
+      modified = true;
+      console.log(`Removed discard-api from dependencies of ${botPath}`);
+    }
+    // Remove from devDependencies
+    if (pkg.devDependencies && pkg.devDependencies['discard-api']) {
+      delete pkg.devDependencies['discard-api'];
+      modified = true;
+      console.log(`Removed discard-api from devDependencies of ${botPath}`);
+    }
+
+    if (modified) {
+      await fs.writeFile(pkgPath, JSON.stringify(pkg, null, 2));
+      return { success: true, fixed: true };
+    }
+    return { success: true, fixed: false };
+  } catch (err) {
+    console.error('Error fixing package.json:', err.message);
+    return { success: false, error: 'Invalid package.json: ' + err.message };
+  }
+}
+
+// Install dependencies with fallback
+async function installDependencies(botPath) {
+  // First fix package.json
+  const fixResult = await fixPackageJson(botPath);
+  if (!fixResult.success) {
+    return { success: false, error: fixResult.error };
+  }
+
+  try {
+    console.log(`Running npm install in ${botPath}...`);
+    await execPromise('npm install --no-audit --no-fund', { cwd: botPath, timeout: 300000 }); // 5 min timeout
+    return { success: true, fixed: fixResult.fixed };
+  } catch (err) {
+    console.error('npm install error:', err.message);
+    // Attempt to read npm-debug.log if exists
+    let debugLog = '';
     try {
-      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-      if (pkg.main) mainScript = pkg.main;
-    } catch (e) {
-      console.warn('Could not parse package.json, using index.js');
+      const logPath = path.join(botPath, 'npm-debug.log');
+      debugLog = await fs.readFile(logPath, 'utf8');
+    } catch {}
+    return { 
+      success: false, 
+      error: 'npm install failed: ' + err.message,
+      details: debugLog.slice(0, 500)
+    };
+  }
+}
+
+// Start bot with PM2, fallback to node
+async function startBot(appName, botPath) {
+  // Determine main script
+  let mainScript = 'index.js';
+  try {
+    const pkgPath = path.join(botPath, 'package.json');
+    const pkg = JSON.parse(await fs.readFile(pkgPath, 'utf8'));
+    if (pkg.main) mainScript = pkg.main;
+  } catch (e) {
+    console.warn('Could not read package.json, using index.js');
+  }
+
+  // Try PM2 first
+  try {
+    console.log(`Starting ${appName} with PM2...`);
+    await execPromise(`npx pm2 start ${mainScript} --name "${appName}"`, { cwd: botPath, timeout: 30000 });
+    // Wait a bit and check status
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    const { stdout } = await execPromise(`npx pm2 show "${appName}"`, { cwd: botPath }).catch(() => ({ stdout: '' }));
+    if (stdout.includes('online')) {
+      await execPromise(`npx pm2 save`, { cwd: botPath });
+      return { success: true, method: 'pm2' };
+    } else {
+      throw new Error('PM2 process not online');
+    }
+  } catch (pm2Err) {
+    console.log(`PM2 failed, trying node directly: ${pm2Err.message}`);
+    // Fallback to node
+    try {
+      const nodeProcess = spawn('node', [mainScript], {
+        cwd: botPath,
+        detached: true,
+        stdio: 'ignore'
+      });
+      nodeProcess.unref();
+      // Wait a bit to see if it crashes
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      // Check if process is still running
+      const { stdout: psOut } = await execPromise(`ps aux | grep "node ${mainScript}" | grep -v grep`);
+      if (psOut.includes(mainScript)) {
+        return { success: true, method: 'node' };
+      } else {
+        // Try to get error output
+        let stderr = '';
+        try {
+          const logPath = path.join(botPath, 'nohup.out');
+          stderr = await fs.readFile(logPath, 'utf8');
+        } catch {}
+        throw new Error(`Node process died. Output: ${stderr.slice(0, 200)}`);
+      }
+    } catch (nodeErr) {
+      return { success: false, error: nodeErr.message };
     }
   }
-
-  // Install dependencies if node_modules doesn't exist
-  if (!fs.existsSync(path.join(botPath, 'node_modules'))) {
-    console.log(`Installing dependencies for ${appName}...`);
-    await execPromise('npm install --no-audit --no-fund', { cwd: botPath });
-  }
-
-  // Start the process
-  console.log(`Starting ${appName} with PM2...`);
-  await execPromise(`npx pm2 start ${mainScript} --name "${appName}"`, { cwd: botPath });
-
-  // Wait a few seconds for the process to stabilize
-  await new Promise(resolve => setTimeout(resolve, 5000));
-
-  // Check process status
-  const { stdout } = await execPromise(`npx pm2 show "${appName}"`, { cwd: botPath }).catch(() => ({ stdout: '' }));
-  if (!stdout.includes('online')) {
-    // Process is not online, get logs
-    const { stdout: logs } = await execPromise(`npx pm2 logs "${appName}" --lines 20 --nostream`, { cwd: botPath }).catch(() => ({ stdout: '' }));
-    throw new Error(`Bot failed to start. Logs:\n${logs}`);
-  }
-
-  // Save PM2 list so it restarts with container
-  await execPromise(`npx pm2 save`, { cwd: botPath });
-
-  return { success: true, mainScript };
 }
 
 // -------------------- API ROUTES --------------------
 
-// Health check
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
-// Get all active plans (public)
 app.get('/api/plans', async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM plans WHERE is_active = true');
   res.json({ plans: rows });
 });
 
-// Check fork and return user data (login endpoint)
 app.post('/check-fork', async (req, res) => {
   const { githubUsername } = req.body;
   if (!githubUsername) return res.status(400).json({ error: 'Username required' });
@@ -179,7 +256,6 @@ app.post('/check-fork', async (req, res) => {
   const user = await pool.query('SELECT * FROM users WHERE github_username = $1', [githubUsername.toLowerCase()]);
   let userData = user.rows[0];
 
-  // Create user if not exists
   if (!userData) {
     await pool.query(
       'INSERT INTO users (github_username, max_bots, subscription_plan) VALUES ($1, $2, $3)',
@@ -195,7 +271,6 @@ app.post('/check-fork', async (req, res) => {
     };
   }
 
-  // Get user's deployed bots
   const bots = await pool.query(
     'SELECT app_name, created_at, status FROM bots WHERE github_username = $1',
     [githubUsername.toLowerCase()]
@@ -215,12 +290,10 @@ app.post('/check-fork', async (req, res) => {
   });
 });
 
-// Deploy bot
 app.post('/deploy', async (req, res) => {
   const { githubUsername, sessionId, appName: customAppName, ...config } = req.body;
   if (!githubUsername || !sessionId) return res.status(400).json({ error: 'Missing fields' });
 
-  // Check user
   const user = await pool.query('SELECT * FROM users WHERE github_username = $1', [githubUsername.toLowerCase()]);
   if (user.rows.length === 0) return res.status(403).json({ error: 'User not found' });
   const userData = user.rows[0];
@@ -228,7 +301,6 @@ app.post('/deploy', async (req, res) => {
   if (userData.is_banned) return res.status(403).json({ error: 'User is banned' });
   if (!userData.is_approved) return res.status(403).json({ error: 'User not approved' });
 
-  // Check bot limit
   const botCount = await pool.query('SELECT COUNT(*) FROM bots WHERE github_username = $1', [githubUsername.toLowerCase()]);
   if (parseInt(botCount.rows[0].count) >= userData.max_bots) {
     return res.status(403).json({ error: `Bot limit reached (max ${userData.max_bots} bots)` });
@@ -237,14 +309,14 @@ app.post('/deploy', async (req, res) => {
   const appName = customAppName || `${githubUsername}-${Date.now()}`.toLowerCase().replace(/[^a-z0-9-]/g, '');
   const botPath = path.join(BOTS_DIR, appName);
 
-  // Clone the user's fork
+  // Clone
   console.log(`Cloning ${githubUsername}/redxbot302 as ${appName}...`);
   const cloneResult = await cloneRepo(githubUsername, appName);
   if (!cloneResult.success) {
     return res.status(500).json({ error: 'Clone failed: ' + cloneResult.error });
   }
 
-  // Write .env file with all config
+  // Write .env
   const envContent = Object.entries({
     SESSION_ID: sessionId,
     OWNER_NUMBER: config.OWNER_NUMBER || '923009842133',
@@ -262,61 +334,71 @@ app.post('/deploy', async (req, res) => {
     AUTO_TYPING: config.AUTO_TYPING || 'false',
     GITHUB_USERNAME: githubUsername
   }).map(([k, v]) => `${k}=${v}`).join('\n');
-  fs.writeFileSync(path.join(botPath, '.env'), envContent);
+  await fs.writeFile(path.join(botPath, '.env'), envContent);
 
-  // Start the bot and verify
-  try {
-    console.log(`Starting bot ${appName}...`);
-    const startResult = await startBotWithPM2(appName, botPath);
-
-    // Update database
-    await pool.query(
-      'INSERT INTO bots (app_name, github_username, status) VALUES ($1, $2, $3)',
-      [appName, githubUsername.toLowerCase(), 'running']
-    );
-    await pool.query(
-      'UPDATE users SET deployment_count = deployment_count + 1 WHERE github_username = $1',
-      [githubUsername.toLowerCase()]
-    );
-    await pool.query('UPDATE servers SET bot_count = bot_count + 1 WHERE id = 1');
-
-    console.log(`Bot ${appName} deployed successfully`);
-    res.json({ 
-      success: true, 
-      appName, 
-      message: `Bot deployed and running (main script: ${startResult.mainScript})` 
-    });
-  } catch (err) {
-    // Clean up on failure
-    console.error(`Failed to start bot ${appName}:`, err.message);
-    fs.rm(botPath, { recursive: true, force: true }, () => {});
-    return res.status(500).json({ error: 'Bot failed to start: ' + err.message });
+  // Install dependencies
+  const installResult = await installDependencies(botPath);
+  if (!installResult.success) {
+    await fs.rm(botPath, { recursive: true, force: true });
+    return res.status(500).json({ error: installResult.error, details: installResult.details });
   }
+
+  // Start bot
+  const startResult = await startBot(appName, botPath);
+  if (!startResult.success) {
+    await fs.rm(botPath, { recursive: true, force: true });
+    return res.status(500).json({ error: 'Bot failed to start: ' + startResult.error });
+  }
+
+  // Save to DB
+  await pool.query(
+    'INSERT INTO bots (app_name, github_username, status) VALUES ($1, $2, $3)',
+    [appName, githubUsername.toLowerCase(), 'running']
+  );
+  await pool.query(
+    'UPDATE users SET deployment_count = deployment_count + 1 WHERE github_username = $1',
+    [githubUsername.toLowerCase()]
+  );
+  await pool.query('UPDATE servers SET bot_count = bot_count + 1 WHERE id = 1');
+
+  const message = installResult.fixed 
+    ? `Bot deployed and running (method: ${startResult.method}, removed discard-api)`
+    : `Bot deployed and running (method: ${startResult.method})`;
+
+  res.json({ success: true, appName, message });
 });
 
-// Get bot logs
 app.post('/bot-logs', async (req, res) => {
   const { appName } = req.body;
+  const botPath = path.join(BOTS_DIR, appName);
   try {
-    const { stdout } = await execPromise(`npx pm2 logs "${appName}" --lines 50 --nostream`, { cwd: BOTS_DIR });
-    res.json({ success: true, logs: stdout });
+    // Try PM2 logs first
+    const { stdout } = await execPromise(`npx pm2 logs "${appName}" --lines 50 --nostream`, { cwd: botPath }).catch(() => ({ stdout: '' }));
+    if (stdout) {
+      return res.json({ success: true, logs: stdout });
+    }
+    // Fallback to nohup.out or system logs
+    const nohupPath = path.join(botPath, 'nohup.out');
+    if (fsSync.existsSync(nohupPath)) {
+      const logs = await fs.readFile(nohupPath, 'utf8');
+      return res.json({ success: true, logs });
+    }
+    res.json({ success: false, error: 'No logs found' });
   } catch (err) {
-    res.status(500).json({ error: 'Could not fetch logs: ' + err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Restart bot
 app.post('/restart-app', async (req, res) => {
   const { appName } = req.body;
   try {
     await execPromise(`npx pm2 restart "${appName}"`);
-    res.json({ success: true, message: 'Bot restarted' });
+    res.json({ success: true, message: 'Restarted' });
   } catch (err) {
-    res.status(500).json({ error: 'Restart failed: ' + err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Delete bot
 app.post('/delete-app', async (req, res) => {
   const { appName, githubUsername } = req.body;
   const botPath = path.join(BOTS_DIR, appName);
@@ -324,45 +406,44 @@ app.post('/delete-app', async (req, res) => {
   try {
     await execPromise(`npx pm2 delete "${appName}"`);
   } catch (err) {
-    // Ignore if process doesn't exist
+    // Ignore
   }
 
-  fs.rm(botPath, { recursive: true, force: true }, async (err) => {
-    if (err) return res.status(500).json({ error: 'Folder deletion failed' });
-    await pool.query('DELETE FROM bots WHERE app_name = $1', [appName]);
-    await pool.query('UPDATE servers SET bot_count = bot_count - 1 WHERE id = 1');
-    res.json({ success: true, message: 'Bot deleted' });
-  });
+  await fs.rm(botPath, { recursive: true, force: true });
+  await pool.query('DELETE FROM bots WHERE app_name = $1', [appName]);
+  await pool.query('UPDATE servers SET bot_count = bot_count - 1 WHERE id = 1');
+  res.json({ success: true, message: 'Bot deleted' });
 });
 
-// Get bot config
-app.post('/get-config', (req, res) => {
+app.post('/get-config', async (req, res) => {
   const { appName } = req.body;
   const envFile = path.join(BOTS_DIR, appName, '.env');
-  if (!fs.existsSync(envFile)) return res.status(404).json({ error: 'Config not found' });
-  const env = fs.readFileSync(envFile, 'utf8').split('\n').reduce((acc, line) => {
-    const [key, ...valArr] = line.split('=');
-    if (key) acc[key] = valArr.join('=');
-    return acc;
-  }, {});
-  res.json({ success: true, config: env });
+  try {
+    const envContent = await fs.readFile(envFile, 'utf8');
+    const config = envContent.split('\n').reduce((acc, line) => {
+      const [key, ...valArr] = line.split('=');
+      if (key) acc[key] = valArr.join('=');
+      return acc;
+    }, {});
+    res.json({ success: true, config });
+  } catch (err) {
+    res.status(404).json({ error: 'Config not found' });
+  }
 });
 
-// Update bot config
 app.post('/update-config', async (req, res) => {
   const { appName, config } = req.body;
   const botPath = path.join(BOTS_DIR, appName);
   const envContent = Object.entries(config).map(([k, v]) => `${k}=${v}`).join('\n');
-  fs.writeFileSync(path.join(botPath, '.env'), envContent);
+  await fs.writeFile(path.join(botPath, '.env'), envContent);
   try {
     await execPromise(`npx pm2 restart "${appName}"`);
     res.json({ success: true, message: 'Config updated and bot restarted' });
   } catch (err) {
-    res.status(500).json({ error: 'Restart after config update failed' });
+    res.status(500).json({ error: 'Restart failed: ' + err.message });
   }
 });
 
-// Buy plan – generates WhatsApp link
 app.post('/api/buy-plan', (req, res) => {
   const { planName, price, githubUsername } = req.body;
   const message = `I want to buy the ${planName} plan (${price}). My GitHub: ${githubUsername}`;
@@ -378,7 +459,6 @@ app.post('/admin/login', (req, res) => {
   res.status(401).json({ error: 'Invalid password' });
 });
 
-// Get all users
 app.post('/admin/users', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { rows } = await pool.query(`
@@ -390,18 +470,9 @@ app.post('/admin/users', async (req, res) => {
   res.json({ users: rows });
 });
 
-// Update user (plan, ban, approve, max bots)
 app.post('/admin/update-user', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  const { 
-    githubUsername, 
-    isApproved, 
-    isBanned, 
-    maxBots, 
-    expiryDate, 
-    subscriptionPlan 
-  } = req.body;
-
+  const { githubUsername, isApproved, isBanned, maxBots, expiryDate, subscriptionPlan } = req.body;
   await pool.query(
     `UPDATE users SET 
       is_approved = COALESCE($2, is_approved),
@@ -415,35 +486,29 @@ app.post('/admin/update-user', async (req, res) => {
   res.json({ success: true });
 });
 
-// Delete user and all their bots
 app.post('/admin/delete-user', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { githubUsername } = req.body;
 
-  // First delete all bots of this user
   const bots = await pool.query('SELECT app_name FROM bots WHERE github_username = $1', [githubUsername.toLowerCase()]);
   for (const bot of bots.rows) {
     try {
       await execPromise(`npx pm2 delete "${bot.app_name}"`);
       const botPath = path.join(BOTS_DIR, bot.app_name);
-      fs.rmSync(botPath, { recursive: true, force: true });
-    } catch (e) {
-      console.warn(`Failed to delete bot ${bot.app_name}:`, e.message);
-    }
+      await fs.rm(botPath, { recursive: true, force: true });
+    } catch (e) {}
   }
 
   await pool.query('DELETE FROM users WHERE github_username = $1', [githubUsername.toLowerCase()]);
   res.json({ success: true });
 });
 
-// Get all plans (admin)
 app.post('/admin/plans', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { rows } = await pool.query('SELECT * FROM plans');
   res.json({ plans: rows });
 });
 
-// Create plan
 app.post('/admin/create-plan', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { name, price, duration_days, max_bots, features } = req.body;
@@ -454,7 +519,6 @@ app.post('/admin/create-plan', async (req, res) => {
   res.json({ success: true });
 });
 
-// Update plan
 app.post('/admin/update-plan', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { id, name, price, duration_days, max_bots, features, is_active } = req.body;
@@ -465,21 +529,18 @@ app.post('/admin/update-plan', async (req, res) => {
   res.json({ success: true });
 });
 
-// Delete plan
 app.post('/admin/delete-plan', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   await pool.query('DELETE FROM plans WHERE id = $1', [req.body.id]);
   res.json({ success: true });
 });
 
-// Get servers
 app.post('/admin/servers', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { rows } = await pool.query('SELECT id, name, bot_count, status FROM servers');
   res.json({ servers: rows });
 });
 
-// Get all bots (admin)
 app.post('/get-all-apps', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { rows } = await pool.query(`
@@ -491,17 +552,15 @@ app.post('/get-all-apps', async (req, res) => {
   res.json({ apps: rows });
 });
 
-// Delete multiple bots (admin)
 app.post('/delete-multiple-apps', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { apps } = req.body;
   const results = { success: [], failed: [] };
-
   for (const { name } of apps) {
     try {
       await execPromise(`npx pm2 delete "${name}"`);
       const botPath = path.join(BOTS_DIR, name);
-      fs.rmSync(botPath, { recursive: true, force: true });
+      await fs.rm(botPath, { recursive: true, force: true });
       await pool.query('DELETE FROM bots WHERE app_name = $1', [name]);
       results.success.push(name);
     } catch {
@@ -511,6 +570,5 @@ app.post('/delete-multiple-apps', async (req, res) => {
   res.json({ success: true, results });
 });
 
-// -------------------- START SERVER --------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
