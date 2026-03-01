@@ -155,16 +155,35 @@ async function installDependencies(botPath) {
   }
 }
 
+// Start bot with PM2 and verify it's running
 async function startBotWithPM2(appName, botPath) {
-  return new Promise((resolve, reject) => {
-    exec(`npx pm2 start index.js --name "${appName}"`, { cwd: botPath }, (err, stdout, stderr) => {
-      if (err) {
-        reject(err);
-      } else {
-        resolve(stdout);
-      }
-    });
-  });
+  // First, check if there's a package.json and what the main script is
+  const pkgPath = path.join(botPath, 'package.json');
+  let mainScript = 'index.js';
+  if (fs.existsSync(pkgPath)) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+      if (pkg.main) mainScript = pkg.main;
+    } catch (e) {
+      console.warn('Could not parse package.json, using index.js');
+    }
+  }
+
+  // Start the process
+  await execPromise(`npx pm2 start ${mainScript} --name "${appName}"`, { cwd: botPath });
+
+  // Wait a few seconds for the process to stabilize
+  await new Promise(resolve => setTimeout(resolve, 3000));
+
+  // Check process status
+  const { stdout } = await execPromise(`npx pm2 show "${appName}"`, { cwd: botPath }).catch(() => ({ stdout: '' }));
+  if (!stdout.includes('online')) {
+    // Process is not online, get logs
+    const { stdout: logs } = await execPromise(`npx pm2 logs "${appName}" --lines 20 --nostream`, { cwd: botPath }).catch(() => ({ stdout: '' }));
+    throw new Error(`Bot failed to start. Logs:\n${logs}`);
+  }
+
+  return { success: true, mainScript };
 }
 
 // API Routes
@@ -218,11 +237,13 @@ app.post('/deploy', async (req, res) => {
   const appName = customAppName || `${githubUsername}-${Date.now()}`.toLowerCase().replace(/[^a-z0-9-]/g, '');
   const botPath = path.join(BOTS_DIR, appName);
 
+  // Clone
   const cloneResult = await cloneRepo(githubUsername, appName);
   if (!cloneResult.success) {
     return res.status(500).json({ error: 'Clone failed: ' + cloneResult.error });
   }
 
+  // Write .env
   const envContent = Object.entries({
     SESSION_ID: sessionId,
     GITHUB_USERNAME: githubUsername,
@@ -230,26 +251,40 @@ app.post('/deploy', async (req, res) => {
   }).map(([k, v]) => `${k}=${v}`).join('\n');
   fs.writeFileSync(path.join(botPath, '.env'), envContent);
 
+  // Install dependencies
   const installResult = await installDependencies(botPath);
   if (!installResult.success) {
     fs.rm(botPath, { recursive: true, force: true }, () => {});
     return res.status(500).json({ error: installResult.error });
   }
 
+  // Start bot and verify
   try {
-    await startBotWithPM2(appName, botPath);
+    const startResult = await startBotWithPM2(appName, botPath);
+    // Save to DB
+    await pool.query('INSERT INTO bots (app_name, github_username) VALUES ($1, $2)', [appName, githubUsername.toLowerCase()]);
+    await pool.query('UPDATE servers SET bot_count = bot_count + 1 WHERE id = 1');
+
+    const message = installResult.fixed 
+      ? `Bot deployed and running (main script: ${startResult.mainScript}, removed "discard-api" from package.json)`
+      : `Bot deployed and running (main script: ${startResult.mainScript})`;
+    res.json({ success: true, appName, message });
   } catch (err) {
+    // Clean up on failure
     fs.rm(botPath, { recursive: true, force: true }, () => {});
-    return res.status(500).json({ error: 'PM2 start failed: ' + err.message });
+    return res.status(500).json({ error: 'Bot failed to start: ' + err.message });
   }
+});
 
-  await pool.query('INSERT INTO bots (app_name, github_username) VALUES ($1, $2)', [appName, githubUsername.toLowerCase()]);
-  await pool.query('UPDATE servers SET bot_count = bot_count + 1 WHERE id = 1');
-
-  const message = installResult.fixed 
-    ? 'Bot deployed successfully (note: removed "discard-api" from package.json)'
-    : 'Bot deployed successfully';
-  res.json({ success: true, appName, message });
+// Get bot status and logs
+app.post('/bot-logs', async (req, res) => {
+  const { appName } = req.body;
+  try {
+    const { stdout } = await execPromise(`npx pm2 logs "${appName}" --lines 50 --nostream`, { cwd: BOTS_DIR });
+    res.json({ success: true, logs: stdout });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not fetch logs: ' + err.message });
+  }
 });
 
 app.post('/restart-app', async (req, res) => {
