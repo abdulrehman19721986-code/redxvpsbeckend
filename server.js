@@ -14,14 +14,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Environment
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'redx';
 const BOTS_DIR = path.join(__dirname, 'bots');
 const MAIN_REPO = 'https://github.com/AbdulRehman19721986/redxbot302.git';
 
 if (!fs.existsSync(BOTS_DIR)) fs.mkdirSync(BOTS_DIR, { recursive: true });
 
-// PostgreSQL
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
@@ -81,7 +79,6 @@ async function initDb() {
 }
 initDb().catch(console.error);
 
-// GitHub fork check
 async function checkFork(username) {
   try {
     const url = `https://api.github.com/repos/AbdulRehman19721986/redxbot302/forks?per_page=100`;
@@ -95,7 +92,6 @@ async function checkFork(username) {
   }
 }
 
-// Clone repo
 async function cloneRepo(githubUsername, appName) {
   const repoUrl = `https://github.com/${githubUsername}/redxbot302.git`;
   const dest = path.join(BOTS_DIR, appName);
@@ -108,7 +104,6 @@ async function cloneRepo(githubUsername, appName) {
   }
 }
 
-// Fix package.json: remove discard-api if present
 function fixPackageJson(botPath) {
   const pkgPath = path.join(botPath, 'package.json');
   if (!fs.existsSync(pkgPath)) {
@@ -119,13 +114,11 @@ function fixPackageJson(botPath) {
     const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
     let modified = false;
 
-    // Check dependencies
     if (pkg.dependencies && pkg.dependencies['discard-api']) {
       delete pkg.dependencies['discard-api'];
       modified = true;
       console.log(`Removed discard-api from dependencies of ${botPath}`);
     }
-    // Check devDependencies
     if (pkg.devDependencies && pkg.devDependencies['discard-api']) {
       delete pkg.devDependencies['discard-api'];
       modified = true;
@@ -143,21 +136,17 @@ function fixPackageJson(botPath) {
   }
 }
 
-// Install dependencies with auto-fix
 async function installDependencies(botPath) {
-  // First, fix package.json
   const fixResult = fixPackageJson(botPath);
   if (!fixResult.success) {
     return { success: false, error: fixResult.error };
   }
 
   try {
-    // Use --no-audit --no-fund to reduce noise, and --force to bypass some errors
-    await execPromise('npm install --no-audit --no-fund --force', { cwd: botPath });
+    await execPromise('npm install --no-audit --no-fund', { cwd: botPath });
     return { success: true, fixed: fixResult.fixed };
   } catch (err) {
     console.error('npm install error:', err.message);
-    // If still failing, return detailed error
     return { 
       success: false, 
       error: 'npm install failed: ' + err.message,
@@ -166,7 +155,6 @@ async function installDependencies(botPath) {
   }
 }
 
-// Start bot with PM2 using npx
 async function startBotWithPM2(appName, botPath) {
   return new Promise((resolve, reject) => {
     exec(`npx pm2 start index.js --name "${appName}"`, { cwd: botPath }, (err, stdout, stderr) => {
@@ -179,8 +167,7 @@ async function startBotWithPM2(appName, botPath) {
   });
 }
 
-// -------------------- API Routes --------------------
-
+// API Routes
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
 app.get('/api/plans', async (req, res) => {
@@ -231,13 +218,11 @@ app.post('/deploy', async (req, res) => {
   const appName = customAppName || `${githubUsername}-${Date.now()}`.toLowerCase().replace(/[^a-z0-9-]/g, '');
   const botPath = path.join(BOTS_DIR, appName);
 
-  // Clone
   const cloneResult = await cloneRepo(githubUsername, appName);
   if (!cloneResult.success) {
     return res.status(500).json({ error: 'Clone failed: ' + cloneResult.error });
   }
 
-  // Write .env
   const envContent = Object.entries({
     SESSION_ID: sessionId,
     GITHUB_USERNAME: githubUsername,
@@ -245,15 +230,12 @@ app.post('/deploy', async (req, res) => {
   }).map(([k, v]) => `${k}=${v}`).join('\n');
   fs.writeFileSync(path.join(botPath, '.env'), envContent);
 
-  // Install dependencies (with auto-fix)
   const installResult = await installDependencies(botPath);
   if (!installResult.success) {
-    // Clean up the cloned folder to avoid clutter
     fs.rm(botPath, { recursive: true, force: true }, () => {});
     return res.status(500).json({ error: installResult.error });
   }
 
-  // Start with PM2
   try {
     await startBotWithPM2(appName, botPath);
   } catch (err) {
@@ -261,11 +243,9 @@ app.post('/deploy', async (req, res) => {
     return res.status(500).json({ error: 'PM2 start failed: ' + err.message });
   }
 
-  // Save to DB
   await pool.query('INSERT INTO bots (app_name, github_username) VALUES ($1, $2)', [appName, githubUsername.toLowerCase()]);
   await pool.query('UPDATE servers SET bot_count = bot_count + 1 WHERE id = 1');
 
-  // If we fixed package.json, include a warning in the response
   const message = installResult.fixed 
     ? 'Bot deployed successfully (note: removed "discard-api" from package.json)'
     : 'Bot deployed successfully';
@@ -288,9 +268,7 @@ app.post('/delete-app', async (req, res) => {
 
   try {
     await execPromise(`npx pm2 delete "${appName}"`);
-  } catch (err) {
-    // Ignore if process doesn't exist
-  }
+  } catch (err) {}
 
   fs.rm(botPath, { recursive: true, force: true }, async (err) => {
     if (err) return res.status(500).json({ error: 'Folder deletion failed' });
@@ -325,7 +303,7 @@ app.post('/update-config', async (req, res) => {
   }
 });
 
-// Admin routes
+// Admin routes (same as before)
 app.post('/admin/users', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { rows } = await pool.query('SELECT * FROM users');
