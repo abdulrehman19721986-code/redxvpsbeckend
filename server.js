@@ -2,16 +2,17 @@ const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
 const axios = require('axios');
-const pm2 = require('pm2');
 const fs = require('fs');
 const path = require('path');
 const simpleGit = require('simple-git');
+const { exec } = require('child_process');
+const util = require('util');
+const execPromise = util.promisify(exec);
 require('dotenv').config();
 
 const app = express();
-app.use(cors()); // Allow all origins (for Vercel frontend)
+app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public'))); // optional
 
 // Environment
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'redx';
@@ -20,13 +21,12 @@ const MAIN_REPO = 'https://github.com/AbdulRehman19721986/redxbot302.git';
 
 if (!fs.existsSync(BOTS_DIR)) fs.mkdirSync(BOTS_DIR, { recursive: true });
 
-// PostgreSQL connection
+// PostgreSQL
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-// Initialize database tables
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -63,14 +63,12 @@ async function initDb() {
     );
   `);
 
-  // Insert default server
   await pool.query(
     `INSERT INTO servers (name, url, api_key, bot_count) 
      VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING`,
     ['Railway Main', 'http://localhost', 'internal', 0]
   );
 
-  // Insert default plans
   const { rows } = await pool.query('SELECT COUNT(*) FROM plans');
   if (parseInt(rows[0].count) === 0) {
     await pool.query(
@@ -83,7 +81,7 @@ async function initDb() {
 }
 initDb().catch(console.error);
 
-// Helper: check GitHub fork (no token)
+// GitHub fork check
 async function checkFork(username) {
   try {
     const url = `https://api.github.com/repos/AbdulRehman19721986/redxbot302/forks?per_page=100`;
@@ -97,7 +95,7 @@ async function checkFork(username) {
   }
 }
 
-// Clone user's fork using simple-git
+// Clone repo
 async function cloneRepo(githubUsername, appName) {
   const repoUrl = `https://github.com/${githubUsername}/redxbot302.git`;
   const dest = path.join(BOTS_DIR, appName);
@@ -108,6 +106,39 @@ async function cloneRepo(githubUsername, appName) {
     console.error('Clone failed:', err.message);
     return { success: false, error: err.message };
   }
+}
+
+// Install dependencies with better error handling
+async function installDependencies(botPath) {
+  try {
+    // Use --no-audit --no-fund to reduce noise, and --force to bypass some errors
+    await execPromise('npm install --no-audit --no-fund --force', { cwd: botPath });
+    return { success: true };
+  } catch (err) {
+    console.error('npm install error:', err.message);
+    // Check for specific error about discard-api
+    if (err.message.includes('discard-api') || err.message.includes('No versions available')) {
+      return { 
+        success: false, 
+        error: 'Your bot repository contains a dependency "discard-api" which does not exist on npm. Please remove it from package.json and try again.',
+        details: err.message
+      };
+    }
+    return { success: false, error: 'npm install failed: ' + err.message };
+  }
+}
+
+// Start bot with PM2 using npx
+async function startBotWithPM2(appName, botPath) {
+  return new Promise((resolve, reject) => {
+    exec(`npx pm2 start index.js --name "${appName}"`, { cwd: botPath }, (err, stdout, stderr) => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve(stdout);
+      }
+    });
+  });
 }
 
 // -------------------- API Routes --------------------
@@ -177,64 +208,53 @@ app.post('/deploy', async (req, res) => {
   fs.writeFileSync(path.join(botPath, '.env'), envContent);
 
   // Install dependencies
-  try {
-    const { exec } = require('child_process');
-    await new Promise((resolve, reject) => {
-      exec('npm install', { cwd: botPath }, (err, stdout, stderr) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-  } catch (err) {
-    return res.status(500).json({ error: 'npm install failed: ' + err.message });
+  const installResult = await installDependencies(botPath);
+  if (!installResult.success) {
+    // Clean up the cloned folder to avoid clutter
+    fs.rm(botPath, { recursive: true, force: true }, () => {});
+    return res.status(500).json({ error: installResult.error });
   }
 
   // Start with PM2
-  pm2.connect((err) => {
-    if (err) return res.status(500).json({ error: 'PM2 connect failed' });
-    pm2.start({
-      script: 'index.js',
-      name: appName,
-      cwd: botPath,
-      env: process.env
-    }, async (err2) => {
-      pm2.disconnect();
-      if (err2) return res.status(500).json({ error: 'PM2 start failed: ' + err2.message });
+  try {
+    await startBotWithPM2(appName, botPath);
+  } catch (err) {
+    fs.rm(botPath, { recursive: true, force: true }, () => {});
+    return res.status(500).json({ error: 'PM2 start failed: ' + err.message });
+  }
 
-      await pool.query('INSERT INTO bots (app_name, github_username) VALUES ($1, $2)', [appName, githubUsername.toLowerCase()]);
-      await pool.query('UPDATE servers SET bot_count = bot_count + 1 WHERE id = 1');
-      res.json({ success: true, appName });
-    });
-  });
+  // Save to DB
+  await pool.query('INSERT INTO bots (app_name, github_username) VALUES ($1, $2)', [appName, githubUsername.toLowerCase()]);
+  await pool.query('UPDATE servers SET bot_count = bot_count + 1 WHERE id = 1');
+
+  res.json({ success: true, appName });
 });
 
-app.post('/restart-app', (req, res) => {
+app.post('/restart-app', async (req, res) => {
   const { appName } = req.body;
-  pm2.connect((err) => {
-    if (err) return res.status(500).json({ error: 'PM2 connect failed' });
-    pm2.restart(appName, (err2) => {
-      pm2.disconnect();
-      if (err2) return res.status(500).json({ error: 'Restart failed' });
-      res.json({ success: true, message: 'Restarted' });
-    });
-  });
+  try {
+    await execPromise(`npx pm2 restart "${appName}"`);
+    res.json({ success: true, message: 'Restarted' });
+  } catch (err) {
+    res.status(500).json({ error: 'Restart failed: ' + err.message });
+  }
 });
 
 app.post('/delete-app', async (req, res) => {
   const { appName, githubUsername } = req.body;
   const botPath = path.join(BOTS_DIR, appName);
 
-  pm2.connect((err) => {
-    if (err) return res.status(500).json({ error: 'PM2 connect failed' });
-    pm2.delete(appName, async (err2) => {
-      pm2.disconnect();
-      fs.rm(botPath, { recursive: true, force: true }, async (err3) => {
-        if (err3) return res.status(500).json({ error: 'Folder deletion failed' });
-        await pool.query('DELETE FROM bots WHERE app_name = $1', [appName]);
-        await pool.query('UPDATE servers SET bot_count = bot_count - 1 WHERE id = 1');
-        res.json({ success: true, message: 'Bot deleted' });
-      });
-    });
+  try {
+    await execPromise(`npx pm2 delete "${appName}"`);
+  } catch (err) {
+    // Ignore if process doesn't exist
+  }
+
+  fs.rm(botPath, { recursive: true, force: true }, async (err) => {
+    if (err) return res.status(500).json({ error: 'Folder deletion failed' });
+    await pool.query('DELETE FROM bots WHERE app_name = $1', [appName]);
+    await pool.query('UPDATE servers SET bot_count = bot_count - 1 WHERE id = 1');
+    res.json({ success: true, message: 'Bot deleted' });
   });
 });
 
@@ -250,22 +270,20 @@ app.post('/get-config', (req, res) => {
   res.json({ success: true, config: env });
 });
 
-app.post('/update-config', (req, res) => {
+app.post('/update-config', async (req, res) => {
   const { appName, config } = req.body;
   const botPath = path.join(BOTS_DIR, appName);
   const envContent = Object.entries(config).map(([k, v]) => `${k}=${v}`).join('\n');
   fs.writeFileSync(path.join(botPath, '.env'), envContent);
-  pm2.connect((err) => {
-    if (err) return res.status(500).json({ error: 'PM2 connect failed' });
-    pm2.restart(appName, (err2) => {
-      pm2.disconnect();
-      if (err2) return res.status(500).json({ error: 'Restart after config update failed' });
-      res.json({ success: true, message: 'Config updated and bot restarted' });
-    });
-  });
+  try {
+    await execPromise(`npx pm2 restart "${appName}"`);
+    res.json({ success: true, message: 'Config updated and bot restarted' });
+  } catch (err) {
+    res.status(500).json({ error: 'Restart after config update failed' });
+  }
 });
 
-// Admin routes (protected by password)
+// Admin routes
 app.post('/admin/users', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { rows } = await pool.query('SELECT * FROM users');
@@ -348,16 +366,7 @@ app.post('/delete-multiple-apps', async (req, res) => {
   const results = { success: [], failed: [] };
   for (const { name } of apps) {
     try {
-      await new Promise((resolve, reject) => {
-        pm2.connect((err) => {
-          if (err) return reject(err);
-          pm2.delete(name, (err2) => {
-            pm2.disconnect();
-            if (err2) return reject(err2);
-            resolve();
-          });
-        });
-      });
+      await execPromise(`npx pm2 delete "${name}"`);
       const botPath = path.join(BOTS_DIR, name);
       fs.rmSync(botPath, { recursive: true, force: true });
       await pool.query('DELETE FROM bots WHERE app_name = $1', [name]);
