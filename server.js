@@ -1,136 +1,101 @@
-// server.js
 const express = require('express');
-const mongoose = require('mongoose');
+const { Pool } = require('pg');
 const cors = require('cors');
-const { exec, spawn } = require('child_process');
+const axios = require('axios');
+const pm2 = require('pm2');
 const fs = require('fs');
 const path = require('path');
+const { exec } = require('child_process');
 require('dotenv').config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public'))); // serve frontend
 
-// ---------- Environment ----------
+// Environment
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'redx';
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN; // optional, for higher rate limits
-const BOTS_DIR = process.env.BOTS_DIR || path.join(__dirname, 'bots'); // directory to store bot clones
-const REPO_URL = 'https://github.com/AbdulRehman19721986/redxbot302.git';
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const BOTS_DIR = path.join(__dirname, 'bots');
+const MAIN_REPO = 'https://github.com/AbdulRehman19721986/redxbot302.git';
 
-if (!fs.existsSync(BOTS_DIR)) fs.mkdirSync(BOTS_DIR, { recursive: true });
+// Ensure bots directory exists
+if (!fs.existsSync(BOTS_DIR)) fs.mkdirSync(BOTS_DIR);
 
-// ---------- MongoDB Models ----------
-const userSchema = new mongoose.Schema({
-  githubUsername: { type: String, unique: true, required: true },
-  isApproved: { type: Boolean, default: true },
-  maxBots: { type: Number, default: 1 },
-  expiryDate: Date,
-  subscriptionPlan: String,
-  deployedBots: [{ appName: String, createdAt: Date }]
-}, { timestamps: true });
-
-const planSchema = new mongoose.Schema({
-  name: String,
-  price: String,
-  duration: String,
-  maxBots: Number,
-  features: [String],
-  isActive: { type: Boolean, default: true }
+// PostgreSQL connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
 
-const User = mongoose.model('User', userSchema);
-const Plan = mongoose.model('Plan', planSchema);
+// Initialize database tables
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      github_username TEXT PRIMARY KEY,
+      is_approved BOOLEAN DEFAULT true,
+      max_bots INTEGER DEFAULT 1,
+      expiry_date TIMESTAMP,
+      subscription_plan TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS bots (
+      app_name TEXT PRIMARY KEY,
+      github_username TEXT REFERENCES users(github_username) ON DELETE CASCADE,
+      server_id INTEGER DEFAULT 1,
+      created_at TIMESTAMP DEFAULT NOW(),
+      status TEXT DEFAULT 'running'
+    );
+    CREATE TABLE IF NOT EXISTS plans (
+      id SERIAL PRIMARY KEY,
+      name TEXT,
+      price TEXT,
+      duration TEXT,
+      max_bots INTEGER,
+      features TEXT[],
+      is_active BOOLEAN DEFAULT true
+    );
+    CREATE TABLE IF NOT EXISTS servers (
+      id SERIAL PRIMARY KEY,
+      name TEXT,
+      url TEXT,
+      api_key TEXT,
+      bot_count INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'online'
+    );
+  `);
+  // Insert default server (this Railway instance)
+  await pool.query(
+    `INSERT INTO servers (name, url, api_key, bot_count) 
+     VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING`,
+    ['Railway Main', 'http://localhost', 'internal', 0]
+  );
+}
+initDb().catch(console.error);
 
-// ---------- In‑memory process tracking ----------
-const runningProcesses = {}; // key: appName, value: child process object
-
-// ---------- Helper: Check GitHub fork ----------
+// Helper: check GitHub fork
 async function checkFork(username) {
   try {
     const headers = GITHUB_TOKEN ? { Authorization: `token ${GITHUB_TOKEN}` } : {};
     const url = `https://api.github.com/repos/AbdulRehman19721986/redxbot302/forks?per_page=100`;
-    const resp = await fetch(url, { headers });
-    const forks = await resp.json();
+    const resp = await axios.get(url, { headers });
+    const forks = resp.data;
     const userFork = forks.find(fork => fork.owner.login.toLowerCase() === username.toLowerCase());
     return { hasFork: !!userFork, forkUrl: userFork?.html_url };
   } catch (e) {
-    console.error('GitHub API error:', e.message);
     return { hasFork: false, error: e.message };
   }
 }
 
-// ---------- Helper: Start a bot process ----------
-function startBotProcess(appName, botPath, envVars) {
-  // Write .env file
-  const envContent = Object.entries(envVars).map(([k, v]) => `${k}=${v}`).join('\n');
-  fs.writeFileSync(path.join(botPath, '.env'), envContent);
-
-  // Run npm install (first time only – we assume it's already installed, but we can force)
-  // For simplicity, we assume dependencies are installed. If not, you'd run `npm install` here.
-
-  // Spawn the bot process
-  const botProcess = spawn('node', ['index.js'], {
-    cwd: botPath,
-    env: { ...process.env, ...envVars },
-    detached: false
-  });
-
-  botProcess.stdout.on('data', (data) => {
-    console.log(`[${appName}] stdout: ${data}`);
-  });
-
-  botProcess.stderr.on('data', (data) => {
-    console.error(`[${appName}] stderr: ${data}`);
-  });
-
-  botProcess.on('close', (code) => {
-    console.log(`[${appName}] exited with code ${code}`);
-    delete runningProcesses[appName];
-  });
-
-  runningProcesses[appName] = botProcess;
-  return botProcess;
-}
-
-// ---------- Helper: Clone repo if not exists ----------
-async function ensureBotCloned(appName, githubUsername) {
-  const botPath = path.join(BOTS_DIR, appName);
-  if (fs.existsSync(botPath)) return botPath;
-
-  // Clone using the user's fork URL (assuming they forked the main repo)
-  const forkUrl = `https://github.com/${githubUsername}/redxbot302.git`;
-  return new Promise((resolve, reject) => {
-    exec(`git clone ${forkUrl} "${botPath}"`, (err) => {
-      if (err) {
-        // If fork clone fails, fallback to main repo (read‑only)
-        exec(`git clone ${REPO_URL} "${botPath}"`, (err2) => {
-          if (err2) reject(err2);
-          else resolve(botPath);
-        });
-      } else {
-        resolve(botPath);
-      }
-    });
-  });
-}
-
-// ---------- Helper: Stop a bot process ----------
-function stopBotProcess(appName) {
-  if (runningProcesses[appName]) {
-    runningProcesses[appName].kill();
-    delete runningProcesses[appName];
-  }
-}
-
-// ---------- Routes ----------
+// -------------------- API Routes --------------------
 
 // Health check
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
 // Get all plans (public)
 app.get('/api/plans', async (req, res) => {
-  const plans = await Plan.find({ isActive: true });
-  res.json({ plans });
+  const { rows } = await pool.query('SELECT * FROM plans WHERE is_active = true');
+  res.json({ plans: rows });
 });
 
 // Check fork and return user data
@@ -139,204 +104,179 @@ app.post('/check-fork', async (req, res) => {
   if (!githubUsername) return res.status(400).json({ error: 'Username required' });
 
   const forkInfo = await checkFork(githubUsername);
-  let user = await User.findOne({ githubUsername: githubUsername.toLowerCase() });
-  if (!user) {
-    user = new User({ githubUsername: githubUsername.toLowerCase(), maxBots: 1 });
-    await user.save();
+  const user = await pool.query(
+    'SELECT * FROM users WHERE github_username = $1',
+    [githubUsername.toLowerCase()]
+  );
+  let userData = user.rows[0];
+  if (!userData) {
+    await pool.query(
+      'INSERT INTO users (github_username) VALUES ($1)',
+      [githubUsername.toLowerCase()]
+    );
+    userData = { github_username: githubUsername.toLowerCase(), is_approved: true, max_bots: 1 };
   }
+
+  const bots = await pool.query(
+    'SELECT app_name, created_at FROM bots WHERE github_username = $1',
+    [githubUsername.toLowerCase()]
+  );
 
   res.json({
     hasFork: forkInfo.hasFork,
     forkUrl: forkInfo.forkUrl,
-    isApproved: user.isApproved,
-    maxBots: user.maxBots,
-    expiryDate: user.expiryDate,
-    subscriptionPlan: user.subscriptionPlan,
-    deployedBots: user.deployedBots || [],
-    currentBots: user.deployedBots?.length || 0
+    isApproved: userData.is_approved,
+    maxBots: userData.max_bots,
+    expiryDate: userData.expiry_date,
+    subscriptionPlan: userData.subscription_plan,
+    deployedBots: bots.rows,
+    currentBots: bots.rows.length
   });
 });
 
 // Deploy bot
 app.post('/deploy', async (req, res) => {
-  const { githubUsername, sessionId, appName, ...config } = req.body;
+  const { githubUsername, sessionId, appName: customAppName, ...config } = req.body;
   if (!githubUsername || !sessionId) return res.status(400).json({ error: 'Missing fields' });
 
-  const user = await User.findOne({ githubUsername: githubUsername.toLowerCase() });
-  if (!user || !user.isApproved) return res.status(403).json({ error: 'User not approved' });
-  if (user.deployedBots.length >= user.maxBots) return res.status(403).json({ error: 'Bot limit reached' });
+  const user = await pool.query('SELECT * FROM users WHERE github_username = $1', [githubUsername.toLowerCase()]);
+  if (user.rows.length === 0) return res.status(403).json({ error: 'User not found' });
+  const userData = user.rows[0];
+  if (!userData.is_approved) return res.status(403).json({ error: 'User not approved' });
 
-  // Generate a unique app name if not provided
-  const finalAppName = appName || `${githubUsername}-${Date.now()}`;
+  const botCount = await pool.query('SELECT COUNT(*) FROM bots WHERE github_username = $1', [githubUsername.toLowerCase()]);
+  if (parseInt(botCount.rows[0].count) >= userData.max_bots) {
+    return res.status(403).json({ error: 'Bot limit reached' });
+  }
 
-  try {
-    // Clone the bot code
-    const botPath = await ensureBotCloned(finalAppName, githubUsername);
+  const appName = customAppName || `${githubUsername}-${Date.now()}`.toLowerCase().replace(/[^a-z0-9-]/g, '');
+  const botPath = path.join(BOTS_DIR, appName);
 
-    // Prepare environment variables
-    const envVars = {
+  // Clone the user's fork
+  const forkUrl = `https://github.com/${githubUsername}/redxbot302.git`;
+  exec(`git clone ${forkUrl} "${botPath}"`, async (err) => {
+    if (err) return res.status(500).json({ error: 'Clone failed', details: err.message });
+
+    // Create .env
+    const envContent = Object.entries({
       SESSION_ID: sessionId,
       GITHUB_USERNAME: githubUsername,
-      PREFIX: config.PREFIX || '.',
-      BOT_NAME: config.BOT_NAME || 'REDX BOT',
-      OWNER_NAME: config.OWNER_NAME || 'Abdul Rehman',
-      OWNER_NUMBER: config.OWNER_NUMBER || '923346690239',
-      AUTO_STATUS_SEEN: config.AUTO_STATUS_SEEN || 'true',
-      AUTO_STATUS_REACT: config.AUTO_STATUS_REACT || 'true',
-      ANTI_DELETE: config.ANTI_DELETE || 'true',
-      ANTI_LINK: config.ANTI_LINK || 'false',
-      ALWAYS_ONLINE: config.ALWAYS_ONLINE || 'false',
-      AUTO_REPLY: config.AUTO_REPLY || 'false',
-      AUTO_STICKER: config.AUTO_STICKER || 'false',
-      WELCOME: config.WELCOME || 'false',
-      READ_MESSAGE: config.READ_MESSAGE || 'false',
-      AUTO_TYPING: config.AUTO_TYPING || 'false'
-    };
+      ...config
+    }).map(([k, v]) => `${k}=${v}`).join('\n');
+    fs.writeFileSync(path.join(botPath, '.env'), envContent);
 
-    // Start the bot process
-    startBotProcess(finalAppName, botPath, envVars);
+    // Install dependencies and start with PM2
+    exec(`cd "${botPath}" && npm install`, (err2) => {
+      if (err2) return res.status(500).json({ error: 'npm install failed' });
 
-    // Save to database
-    user.deployedBots.push({ appName: finalAppName, createdAt: new Date() });
-    await user.save();
+      pm2.connect((err3) => {
+        if (err3) return res.status(500).json({ error: 'PM2 connect failed' });
+        pm2.start({
+          script: 'index.js',
+          name: appName,
+          cwd: botPath,
+          env: process.env
+        }, async (err4, proc) => {
+          pm2.disconnect();
+          if (err4) return res.status(500).json({ error: 'PM2 start failed' });
 
-    res.json({ success: true, appName: finalAppName });
-  } catch (error) {
-    console.error('Deploy error:', error);
-    res.status(500).json({ error: 'Deployment failed', details: error.message });
-  }
+          // Save to database
+          await pool.query(
+            'INSERT INTO bots (app_name, github_username) VALUES ($1, $2)',
+            [appName, githubUsername.toLowerCase()]
+          );
+          await pool.query('UPDATE servers SET bot_count = bot_count + 1 WHERE id = 1');
+          res.json({ success: true, appName });
+        });
+      });
+    });
+  });
 });
 
 // Restart bot
-app.post('/restart-app', async (req, res) => {
+app.post('/restart-app', (req, res) => {
   const { appName } = req.body;
-  const user = await User.findOne({ 'deployedBots.appName': appName });
-  if (!user) return res.status(404).json({ error: 'Bot not found' });
-
-  stopBotProcess(appName);
-
-  // Find the bot path and restart
-  const botPath = path.join(BOTS_DIR, appName);
-  if (!fs.existsSync(botPath)) return res.status(404).json({ error: 'Bot folder missing' });
-
-  // Reload environment from .env file (or from DB – you could store config separately)
-  // For simplicity, we just restart with existing .env
-  const envFile = fs.readFileSync(path.join(botPath, '.env'), 'utf8');
-  const envVars = {};
-  envFile.split('\n').forEach(line => {
-    const [key, val] = line.split('=');
-    if (key && val) envVars[key] = val;
+  pm2.connect((err) => {
+    if (err) return res.status(500).json({ error: 'PM2 connect failed' });
+    pm2.restart(appName, (err2, proc) => {
+      pm2.disconnect();
+      if (err2) return res.status(500).json({ error: 'Restart failed' });
+      res.json({ success: true, message: 'Restarted' });
+    });
   });
-
-  startBotProcess(appName, botPath, envVars);
-  res.json({ success: true, message: 'Restarted' });
-});
-
-// Get bot config (returns .env content)
-app.post('/get-config', async (req, res) => {
-  const { appName } = req.body;
-  const botPath = path.join(BOTS_DIR, appName);
-  if (!fs.existsSync(botPath)) return res.status(404).json({ error: 'Bot not found' });
-
-  const envFile = fs.readFileSync(path.join(botPath, '.env'), 'utf8');
-  const config = {};
-  envFile.split('\n').forEach(line => {
-    const [key, val] = line.split('=');
-    if (key && val) config[key] = val;
-  });
-  res.json({ success: true, config });
-});
-
-// Update bot config
-app.post('/update-config', async (req, res) => {
-  const { appName, config } = req.body;
-  const botPath = path.join(BOTS_DIR, appName);
-  if (!fs.existsSync(botPath)) return res.status(404).json({ error: 'Bot not found' });
-
-  // Write new .env
-  const envContent = Object.entries(config).map(([k, v]) => `${k}=${v}`).join('\n');
-  fs.writeFileSync(path.join(botPath, '.env'), envContent);
-
-  // Restart bot to apply changes
-  stopBotProcess(appName);
-  startBotProcess(appName, botPath, config);
-
-  res.json({ success: true, message: 'Config updated and bot restarted' });
 });
 
 // Delete bot
 app.post('/delete-app', async (req, res) => {
   const { appName, githubUsername } = req.body;
-  const user = await User.findOne({ githubUsername: githubUsername?.toLowerCase() });
-  if (!user) return res.status(404).json({ error: 'User not found' });
-
-  const botIndex = user.deployedBots.findIndex(b => b.appName === appName);
-  if (botIndex === -1) return res.status(404).json({ error: 'Bot not found' });
-
-  // Stop process
-  stopBotProcess(appName);
-
-  // Remove folder
   const botPath = path.join(BOTS_DIR, appName);
-  fs.rm(botPath, { recursive: true, force: true }, (err) => {
-    if (err) console.error('Folder deletion error:', err);
+
+  pm2.connect((err) => {
+    if (err) return res.status(500).json({ error: 'PM2 connect failed' });
+    pm2.delete(appName, async (err2) => {
+      pm2.disconnect();
+      // Remove folder
+      fs.rm(botPath, { recursive: true, force: true }, async (err3) => {
+        if (err3) return res.status(500).json({ error: 'Folder deletion failed' });
+        await pool.query('DELETE FROM bots WHERE app_name = $1', [appName]);
+        await pool.query('UPDATE servers SET bot_count = bot_count - 1 WHERE id = 1');
+        res.json({ success: true, message: 'Bot deleted' });
+      });
+    });
   });
-
-  // Remove from DB
-  user.deployedBots.splice(botIndex, 1);
-  await user.save();
-
-  res.json({ success: true, message: 'Bot deleted' });
 });
 
-// Delete multiple bots (admin)
-app.post('/delete-multiple-apps', async (req, res) => {
-  if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  const { apps } = req.body; // array of { name, serverId } – serverId unused here
-  const results = { success: [], failed: [] };
-
-  for (const { name } of apps) {
-    try {
-      stopBotProcess(name);
-      const botPath = path.join(BOTS_DIR, name);
-      if (fs.existsSync(botPath)) {
-        fs.rmSync(botPath, { recursive: true, force: true });
-      }
-      // Remove from any user's deployedBots
-      await User.updateMany(
-        { 'deployedBots.appName': name },
-        { $pull: { deployedBots: { appName: name } } }
-      );
-      results.success.push(name);
-    } catch (e) {
-      results.failed.push(name);
-    }
-  }
-  res.json({ success: true, results });
+// Get bot config (for editing)
+app.post('/get-config', (req, res) => {
+  const { appName } = req.body;
+  const botPath = path.join(BOTS_DIR, appName);
+  const envFile = path.join(botPath, '.env');
+  if (!fs.existsSync(envFile)) return res.status(404).json({ error: 'Config not found' });
+  const env = fs.readFileSync(envFile, 'utf8').split('\n').reduce((acc, line) => {
+    const [key, val] = line.split('=');
+    if (key) acc[key] = val;
+    return acc;
+  }, {});
+  res.json({ success: true, config: env });
 });
 
-// Admin login
-app.post('/admin-login', (req, res) => {
-  const { password } = req.body;
-  if (password === ADMIN_PASSWORD) return res.json({ success: true });
-  res.status(401).json({ error: 'Invalid password' });
+// Update bot config
+app.post('/update-config', (req, res) => {
+  const { appName, config } = req.body;
+  const botPath = path.join(BOTS_DIR, appName);
+  const envContent = Object.entries(config).map(([k, v]) => `${k}=${v}`).join('\n');
+  fs.writeFileSync(path.join(botPath, '.env'), envContent);
+  // Restart to apply new env
+  pm2.connect((err) => {
+    if (err) return res.status(500).json({ error: 'PM2 connect failed' });
+    pm2.restart(appName, (err2) => {
+      pm2.disconnect();
+      if (err2) return res.status(500).json({ error: 'Restart after config update failed' });
+      res.json({ success: true, message: 'Config updated and bot restarted' });
+    });
+  });
 });
 
 // Admin: get all users
 app.post('/admin/users', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  const users = await User.find();
-  res.json({ users });
+  const { rows } = await pool.query('SELECT * FROM users');
+  res.json({ users: rows });
 });
 
 // Admin: update user
 app.post('/admin/update-user', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { githubUsername, isApproved, maxBots, expiryDate, subscriptionPlan } = req.body;
-  await User.findOneAndUpdate(
-    { githubUsername: githubUsername.toLowerCase() },
-    { isApproved, maxBots, expiryDate, subscriptionPlan },
-    { upsert: true }
+  await pool.query(
+    `INSERT INTO users (github_username, is_approved, max_bots, expiry_date, subscription_plan)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (github_username) DO UPDATE SET
+       is_approved = EXCLUDED.is_approved,
+       max_bots = EXCLUDED.max_bots,
+       expiry_date = EXCLUDED.expiry_date,
+       subscription_plan = EXCLUDED.subscription_plan`,
+    [githubUsername.toLowerCase(), isApproved, maxBots, expiryDate, subscriptionPlan]
   );
   res.json({ success: true });
 });
@@ -344,52 +284,93 @@ app.post('/admin/update-user', async (req, res) => {
 // Admin: delete user
 app.post('/admin/delete-user', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  await User.deleteOne({ githubUsername: req.body.githubUsername.toLowerCase() });
+  await pool.query('DELETE FROM users WHERE github_username = $1', [req.body.githubUsername.toLowerCase()]);
   res.json({ success: true });
 });
 
 // Admin: get plans
 app.post('/admin/plans', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  const plans = await Plan.find();
-  res.json({ plans });
+  const { rows } = await pool.query('SELECT * FROM plans');
+  res.json({ plans: rows });
 });
 
 // Admin: create plan
 app.post('/admin/create-plan', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  const plan = new Plan(req.body);
-  await plan.save();
+  const { name, price, duration, maxBots, features } = req.body;
+  await pool.query(
+    'INSERT INTO plans (name, price, duration, max_bots, features) VALUES ($1, $2, $3, $4, $5)',
+    [name, price, duration, maxBots, features]
+  );
   res.json({ success: true });
 });
 
 // Admin: update plan
 app.post('/admin/update-plan', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  const { _id, ...data } = req.body;
-  await Plan.findByIdAndUpdate(_id, data);
+  const { id, name, price, duration, maxBots, features } = req.body;
+  await pool.query(
+    'UPDATE plans SET name=$1, price=$2, duration=$3, max_bots=$4, features=$5 WHERE id=$6',
+    [name, price, duration, maxBots, features, id]
+  );
   res.json({ success: true });
 });
 
 // Admin: delete plan
 app.post('/admin/delete-plan', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  await Plan.findByIdAndDelete(req.body._id);
+  await pool.query('DELETE FROM plans WHERE id = $1', [req.body.id]);
   res.json({ success: true });
 });
 
-// Admin: get all bots (across users)
-app.post('/get-all-apps', async (req, res) => {
+// Admin: get servers
+app.post('/admin/servers', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  const users = await User.find();
-  const apps = [];
-  users.forEach(u => {
-    u.deployedBots.forEach(b => apps.push({ ...b.toObject(), githubUsername: u.githubUsername }));
-  });
-  res.json({ apps });
+  const { rows } = await pool.query('SELECT id, name, bot_count, status FROM servers');
+  res.json({ servers: rows });
 });
 
-// Simple buy-plan endpoint (generates WhatsApp link)
+// Admin: get all bots
+app.post('/get-all-apps', async (req, res) => {
+  if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
+  const { rows } = await pool.query(`
+    SELECT b.app_name, b.github_username, b.created_at, s.name as server_name
+    FROM bots b
+    JOIN servers s ON b.server_id = s.id
+  `);
+  res.json({ apps: rows });
+});
+
+// Admin: delete multiple bots
+app.post('/delete-multiple-apps', async (req, res) => {
+  if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
+  const { apps } = req.body;
+  const results = { success: [], failed: [] };
+  for (const { name } of apps) {
+    try {
+      await new Promise((resolve, reject) => {
+        pm2.connect((err) => {
+          if (err) return reject(err);
+          pm2.delete(name, (err2) => {
+            pm2.disconnect();
+            if (err2) return reject(err2);
+            resolve();
+          });
+        });
+      });
+      const botPath = path.join(BOTS_DIR, name);
+      fs.rmSync(botPath, { recursive: true, force: true });
+      await pool.query('DELETE FROM bots WHERE app_name = $1', [name]);
+      results.success.push(name);
+    } catch {
+      results.failed.push(name);
+    }
+  }
+  res.json({ success: true, results });
+});
+
+// Buy plan – WhatsApp link generator
 app.post('/api/buy-plan', (req, res) => {
   const { planName, price, githubUsername } = req.body;
   const message = `I want to buy the ${planName} plan (${price}). My GitHub: ${githubUsername}`;
@@ -397,36 +378,10 @@ app.post('/api/buy-plan', (req, res) => {
   res.json({ whatsappLink });
 });
 
-// ---------- Restore bots on startup ----------
-async function restoreBots() {
-  console.log('Restoring bots from database...');
-  const users = await User.find();
-  for (const user of users) {
-    for (const bot of user.deployedBots) {
-      const appName = bot.appName;
-      const botPath = path.join(BOTS_DIR, appName);
-      if (!fs.existsSync(botPath)) {
-        console.log(`Bot ${appName} folder missing, skipping.`);
-        continue;
-      }
-      // Read .env file
-      const envFile = fs.readFileSync(path.join(botPath, '.env'), 'utf8');
-      const envVars = {};
-      envFile.split('\n').forEach(line => {
-        const [key, val] = line.split('=');
-        if (key && val) envVars[key] = val;
-      });
-      console.log(`Starting bot ${appName}...`);
-      startBotProcess(appName, botPath, envVars);
-    }
-  }
-  console.log('Restore complete.');
-}
+// Serve frontend for any unmatched route (SPA support)
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
-// ---------- Connect to MongoDB and start server ----------
 const PORT = process.env.PORT || 3000;
-mongoose.connect(process.env.MONGODB_URI).then(async () => {
-  console.log('Connected to MongoDB');
-  await restoreBots();
-  app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
-}).catch(err => console.error('MongoDB error:', err));
+app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
