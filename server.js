@@ -6,7 +6,7 @@ const fs = require('fs').promises;
 const fsSync = require('fs');
 const path = require('path');
 const simpleGit = require('simple-git');
-const { exec, spawn } = require('child_process');
+const { spawn, exec } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
 require('dotenv').config();
@@ -157,7 +157,6 @@ async function fixPackageJson(botPath) {
 
 // Install dependencies with fallback
 async function installDependencies(botPath) {
-  // First fix package.json
   const fixResult = await fixPackageJson(botPath);
   if (!fixResult.success) {
     return { success: false, error: fixResult.error };
@@ -165,11 +164,10 @@ async function installDependencies(botPath) {
 
   try {
     console.log(`Running npm install in ${botPath}...`);
-    await execPromise('npm install --no-audit --no-fund', { cwd: botPath, timeout: 300000 }); // 5 min timeout
+    await execPromise('npm install --no-audit --no-fund', { cwd: botPath, timeout: 300000 });
     return { success: true, fixed: fixResult.fixed };
   } catch (err) {
     console.error('npm install error:', err.message);
-    // Attempt to read npm-debug.log if exists
     let debugLog = '';
     try {
       const logPath = path.join(botPath, 'npm-debug.log');
@@ -183,7 +181,7 @@ async function installDependencies(botPath) {
   }
 }
 
-// Start bot with PM2, fallback to node
+// Start bot using node (simple, no PM2)
 async function startBot(appName, botPath) {
   // Determine main script
   let mainScript = 'index.js';
@@ -195,47 +193,65 @@ async function startBot(appName, botPath) {
     console.warn('Could not read package.json, using index.js');
   }
 
-  // Try PM2 first
+  // Spawn the node process
+  const botProcess = spawn('node', [mainScript], {
+    cwd: botPath,
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  // Save PID to a file for later management
+  const pidFile = path.join(botPath, 'bot.pid');
+  await fs.writeFile(pidFile, botProcess.pid.toString());
+
+  // Capture stdout/stderr for logs
+  const logFile = path.join(botPath, 'bot.log');
+  const logStream = fsSync.createWriteStream(logFile, { flags: 'a' });
+  botProcess.stdout.pipe(logStream);
+  botProcess.stderr.pipe(logStream);
+
+  botProcess.unref();
+
+  // Wait a moment to see if it crashes
+  await new Promise(resolve => setTimeout(resolve, 5000));
+
+  // Check if process is still running
   try {
-    console.log(`Starting ${appName} with PM2...`);
-    await execPromise(`npx pm2 start ${mainScript} --name "${appName}"`, { cwd: botPath, timeout: 30000 });
-    // Wait a bit and check status
-    await new Promise(resolve => setTimeout(resolve, 5000));
-    const { stdout } = await execPromise(`npx pm2 show "${appName}"`, { cwd: botPath }).catch(() => ({ stdout: '' }));
-    if (stdout.includes('online')) {
-      await execPromise(`npx pm2 save`, { cwd: botPath });
-      return { success: true, method: 'pm2' };
-    } else {
-      throw new Error('PM2 process not online');
-    }
-  } catch (pm2Err) {
-    console.log(`PM2 failed, trying node directly: ${pm2Err.message}`);
-    // Fallback to node
+    process.kill(botProcess.pid, 0); // throws if not running
+    return { success: true, method: 'node', pid: botProcess.pid };
+  } catch (err) {
+    // Process died, get last few lines of log
+    let logs = '';
     try {
-      const nodeProcess = spawn('node', [mainScript], {
-        cwd: botPath,
-        detached: true,
-        stdio: 'ignore'
-      });
-      nodeProcess.unref();
-      // Wait a bit to see if it crashes
-      await new Promise(resolve => setTimeout(resolve, 5000));
-      // Check if process is still running
-      const { stdout: psOut } = await execPromise(`ps aux | grep "node ${mainScript}" | grep -v grep`);
-      if (psOut.includes(mainScript)) {
-        return { success: true, method: 'node' };
-      } else {
-        // Try to get error output
-        let stderr = '';
-        try {
-          const logPath = path.join(botPath, 'nohup.out');
-          stderr = await fs.readFile(logPath, 'utf8');
-        } catch {}
-        throw new Error(`Node process died. Output: ${stderr.slice(0, 200)}`);
-      }
-    } catch (nodeErr) {
-      return { success: false, error: nodeErr.message };
-    }
+      logs = await fs.readFile(logFile, 'utf8');
+    } catch {}
+    return { success: false, error: `Bot died shortly after start. Logs:\n${logs.slice(-500)}` };
+  }
+}
+
+// Stop bot by PID
+async function stopBot(appName) {
+  const botPath = path.join(BOTS_DIR, appName);
+  const pidFile = path.join(botPath, 'bot.pid');
+  try {
+    const pid = parseInt(await fs.readFile(pidFile, 'utf8'));
+    process.kill(pid, 'SIGTERM');
+    await fs.unlink(pidFile);
+  } catch (err) {
+    // ignore if no pid file
+  }
+}
+
+// Get bot logs
+async function getBotLogs(appName, lines = 50) {
+  const botPath = path.join(BOTS_DIR, appName);
+  const logFile = path.join(botPath, 'bot.log');
+  try {
+    const content = await fs.readFile(logFile, 'utf8');
+    const logLines = content.split('\n').slice(-lines).join('\n');
+    return logLines;
+  } catch {
+    return 'No logs available';
   }
 }
 
@@ -362,40 +378,28 @@ app.post('/deploy', async (req, res) => {
   await pool.query('UPDATE servers SET bot_count = bot_count + 1 WHERE id = 1');
 
   const message = installResult.fixed 
-    ? `Bot deployed and running (method: ${startResult.method}, removed discard-api)`
-    : `Bot deployed and running (method: ${startResult.method})`;
+    ? `Bot deployed and running (PID: ${startResult.pid}, removed discard-api)`
+    : `Bot deployed and running (PID: ${startResult.pid})`;
 
   res.json({ success: true, appName, message });
 });
 
 app.post('/bot-logs', async (req, res) => {
   const { appName } = req.body;
-  const botPath = path.join(BOTS_DIR, appName);
-  try {
-    // Try PM2 logs first
-    const { stdout } = await execPromise(`npx pm2 logs "${appName}" --lines 50 --nostream`, { cwd: botPath }).catch(() => ({ stdout: '' }));
-    if (stdout) {
-      return res.json({ success: true, logs: stdout });
-    }
-    // Fallback to nohup.out or system logs
-    const nohupPath = path.join(botPath, 'nohup.out');
-    if (fsSync.existsSync(nohupPath)) {
-      const logs = await fs.readFile(nohupPath, 'utf8');
-      return res.json({ success: true, logs });
-    }
-    res.json({ success: false, error: 'No logs found' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  const logs = await getBotLogs(appName);
+  res.json({ success: true, logs });
 });
 
 app.post('/restart-app', async (req, res) => {
   const { appName } = req.body;
-  try {
-    await execPromise(`npx pm2 restart "${appName}"`);
+  const botPath = path.join(BOTS_DIR, appName);
+  await stopBot(appName);
+  // Restart using same .env
+  const startResult = await startBot(appName, botPath);
+  if (startResult.success) {
     res.json({ success: true, message: 'Restarted' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  } else {
+    res.status(500).json({ error: startResult.error });
   }
 });
 
@@ -403,12 +407,7 @@ app.post('/delete-app', async (req, res) => {
   const { appName, githubUsername } = req.body;
   const botPath = path.join(BOTS_DIR, appName);
 
-  try {
-    await execPromise(`npx pm2 delete "${appName}"`);
-  } catch (err) {
-    // Ignore
-  }
-
+  await stopBot(appName);
   await fs.rm(botPath, { recursive: true, force: true });
   await pool.query('DELETE FROM bots WHERE app_name = $1', [appName]);
   await pool.query('UPDATE servers SET bot_count = bot_count - 1 WHERE id = 1');
@@ -436,11 +435,13 @@ app.post('/update-config', async (req, res) => {
   const botPath = path.join(BOTS_DIR, appName);
   const envContent = Object.entries(config).map(([k, v]) => `${k}=${v}`).join('\n');
   await fs.writeFile(path.join(botPath, '.env'), envContent);
-  try {
-    await execPromise(`npx pm2 restart "${appName}"`);
+  // Restart to apply new config
+  await stopBot(appName);
+  const startResult = await startBot(appName, botPath);
+  if (startResult.success) {
     res.json({ success: true, message: 'Config updated and bot restarted' });
-  } catch (err) {
-    res.status(500).json({ error: 'Restart failed: ' + err.message });
+  } else {
+    res.status(500).json({ error: 'Restart after config update failed: ' + startResult.error });
   }
 });
 
@@ -492,11 +493,9 @@ app.post('/admin/delete-user', async (req, res) => {
 
   const bots = await pool.query('SELECT app_name FROM bots WHERE github_username = $1', [githubUsername.toLowerCase()]);
   for (const bot of bots.rows) {
-    try {
-      await execPromise(`npx pm2 delete "${bot.app_name}"`);
-      const botPath = path.join(BOTS_DIR, bot.app_name);
-      await fs.rm(botPath, { recursive: true, force: true });
-    } catch (e) {}
+    await stopBot(bot.app_name);
+    const botPath = path.join(BOTS_DIR, bot.app_name);
+    await fs.rm(botPath, { recursive: true, force: true });
   }
 
   await pool.query('DELETE FROM users WHERE github_username = $1', [githubUsername.toLowerCase()]);
@@ -558,7 +557,7 @@ app.post('/delete-multiple-apps', async (req, res) => {
   const results = { success: [], failed: [] };
   for (const { name } of apps) {
     try {
-      await execPromise(`npx pm2 delete "${name}"`);
+      await stopBot(name);
       const botPath = path.join(BOTS_DIR, name);
       await fs.rm(botPath, { recursive: true, force: true });
       await pool.query('DELETE FROM bots WHERE app_name = $1', [name]);
