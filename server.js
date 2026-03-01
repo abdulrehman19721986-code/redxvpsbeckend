@@ -12,7 +12,11 @@ const execPromise = util.promisify(exec);
 require('dotenv').config();
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: '*', // Allow all origins (for development; restrict in production)
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type']
+}));
 app.use(express.json());
 
 // -------------------- CONFIG --------------------
@@ -28,65 +32,137 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// -------------------- DATABASE INIT --------------------
-async function initDb() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      github_username TEXT PRIMARY KEY,
-      is_approved BOOLEAN DEFAULT true,
-      is_banned BOOLEAN DEFAULT false,
-      max_bots INTEGER DEFAULT 2,
-      deployment_count INTEGER DEFAULT 0,
-      expiry_date TIMESTAMP,
-      subscription_plan TEXT DEFAULT 'free',
-      created_at TIMESTAMP DEFAULT NOW()
+// -------------------- DATABASE MIGRATION --------------------
+async function migrateDb() {
+  // Check if users table exists and add missing columns
+  const client = await pool.connect();
+  try {
+    // Create users table if not exists (with all columns)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        github_username TEXT PRIMARY KEY,
+        is_approved BOOLEAN DEFAULT true,
+        is_banned BOOLEAN DEFAULT false,
+        max_bots INTEGER DEFAULT 2,
+        deployment_count INTEGER DEFAULT 0,
+        expiry_date TIMESTAMP,
+        subscription_plan TEXT DEFAULT 'free',
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    // Add missing columns if they don't exist (PostgreSQL doesn't have IF NOT EXISTS for columns, so we use DO block)
+    await client.query(`
+      DO $$
+      BEGIN
+        BEGIN
+          ALTER TABLE users ADD COLUMN is_banned BOOLEAN DEFAULT false;
+        EXCEPTION
+          WHEN duplicate_column THEN RAISE NOTICE 'column is_banned already exists';
+        END;
+      END $$;
+    `);
+    await client.query(`
+      DO $$
+      BEGIN
+        BEGIN
+          ALTER TABLE users ADD COLUMN deployment_count INTEGER DEFAULT 0;
+        EXCEPTION
+          WHEN duplicate_column THEN RAISE NOTICE 'column deployment_count already exists';
+        END;
+      END $$;
+    `);
+    await client.query(`
+      DO $$
+      BEGIN
+        BEGIN
+          ALTER TABLE users ADD COLUMN max_bots INTEGER DEFAULT 2;
+        EXCEPTION
+          WHEN duplicate_column THEN RAISE NOTICE 'column max_bots already exists';
+        END;
+      END $$;
+    `);
+    await client.query(`
+      DO $$
+      BEGIN
+        BEGIN
+          ALTER TABLE users ADD COLUMN subscription_plan TEXT DEFAULT 'free';
+        EXCEPTION
+          WHEN duplicate_column THEN RAISE NOTICE 'column subscription_plan already exists';
+        END;
+      END $$;
+    `);
+    await client.query(`
+      DO $$
+      BEGIN
+        BEGIN
+          ALTER TABLE users ADD COLUMN expiry_date TIMESTAMP;
+        EXCEPTION
+          WHEN duplicate_column THEN RAISE NOTICE 'column expiry_date already exists';
+        END;
+      END $$;
+    `);
+
+    // Create bots table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS bots (
+        app_name TEXT PRIMARY KEY,
+        github_username TEXT REFERENCES users(github_username) ON DELETE CASCADE,
+        server_id INTEGER DEFAULT 1,
+        created_at TIMESTAMP DEFAULT NOW(),
+        status TEXT DEFAULT 'running'
+      );
+    `);
+
+    // Create plans table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS plans (
+        id SERIAL PRIMARY KEY,
+        name TEXT UNIQUE,
+        price TEXT,
+        duration_days INTEGER,
+        max_bots INTEGER,
+        features TEXT[],
+        is_active BOOLEAN DEFAULT true
+      );
+    `);
+
+    // Create servers table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS servers (
+        id SERIAL PRIMARY KEY,
+        name TEXT,
+        url TEXT,
+        api_key TEXT,
+        bot_count INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'online'
+      );
+    `);
+
+    // Insert default server
+    await client.query(
+      `INSERT INTO servers (name, url, api_key, bot_count) 
+       VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING`,
+      ['Railway Main', 'http://localhost', 'internal', 0]
     );
 
-    CREATE TABLE IF NOT EXISTS bots (
-      app_name TEXT PRIMARY KEY,
-      github_username TEXT REFERENCES users(github_username) ON DELETE CASCADE,
-      server_id INTEGER DEFAULT 1,
-      created_at TIMESTAMP DEFAULT NOW(),
-      status TEXT DEFAULT 'running'
-    );
-
-    CREATE TABLE IF NOT EXISTS plans (
-      id SERIAL PRIMARY KEY,
-      name TEXT UNIQUE,
-      price TEXT,
-      duration_days INTEGER,
-      max_bots INTEGER,
-      features TEXT[],
-      is_active BOOLEAN DEFAULT true
-    );
-
-    CREATE TABLE IF NOT EXISTS servers (
-      id SERIAL PRIMARY KEY,
-      name TEXT,
-      url TEXT,
-      api_key TEXT,
-      bot_count INTEGER DEFAULT 0,
-      status TEXT DEFAULT 'online'
-    );
-  `);
-
-  await pool.query(
-    `INSERT INTO servers (name, url, api_key, bot_count) 
-     VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING`,
-    ['Railway Main', 'http://localhost', 'internal', 0]
-  );
-
-  const { rows } = await pool.query('SELECT COUNT(*) FROM plans');
-  if (parseInt(rows[0].count) === 0) {
-    await pool.query(
-      `INSERT INTO plans (name, price, duration_days, max_bots, features) VALUES 
-       ('free', 'Free', 36500, 2, ARRAY['2 bots', 'Basic features', 'Community support']),
-       ('pro', '$5/month', 30, 5, ARRAY['5 bots', 'Advanced features', 'Priority support']),
-       ('premium', '$10/month', 30, 10, ARRAY['10 bots', 'All features', 'VIP support', 'Early access'])`
-    );
+    // Insert default plans if none exist
+    const { rows } = await client.query('SELECT COUNT(*) FROM plans');
+    if (parseInt(rows[0].count) === 0) {
+      await client.query(
+        `INSERT INTO plans (name, price, duration_days, max_bots, features) VALUES 
+         ('free', 'Free', 36500, 2, ARRAY['2 bots', 'Basic features', 'Community support']),
+         ('pro', '$5/month', 30, 5, ARRAY['5 bots', 'Advanced features', 'Priority support']),
+         ('premium', '$10/month', 30, 10, ARRAY['10 bots', 'All features', 'VIP support', 'Early access'])`
+      );
+    }
+  } catch (err) {
+    console.error('Migration error:', err);
+  } finally {
+    client.release();
   }
 }
-initDb().catch(console.error);
+migrateDb().catch(console.error);
 
 // -------------------- HELPER FUNCTIONS --------------------
 
@@ -131,13 +207,11 @@ async function fixPackageJson(botPath) {
     const pkg = JSON.parse(content);
     let modified = false;
 
-    // Remove from dependencies
     if (pkg.dependencies && pkg.dependencies['discard-api']) {
       delete pkg.dependencies['discard-api'];
       modified = true;
       console.log(`Removed discard-api from dependencies of ${botPath}`);
     }
-    // Remove from devDependencies
     if (pkg.devDependencies && pkg.devDependencies['discard-api']) {
       delete pkg.devDependencies['discard-api'];
       modified = true;
@@ -155,7 +229,7 @@ async function fixPackageJson(botPath) {
   }
 }
 
-// Install dependencies with fallback
+// Install dependencies
 async function installDependencies(botPath) {
   const fixResult = await fixPackageJson(botPath);
   if (!fixResult.success) {
@@ -181,9 +255,8 @@ async function installDependencies(botPath) {
   }
 }
 
-// Start bot using node (simple, no PM2)
+// Start bot using node
 async function startBot(appName, botPath) {
-  // Determine main script
   let mainScript = 'index.js';
   try {
     const pkgPath = path.join(botPath, 'package.json');
@@ -193,18 +266,15 @@ async function startBot(appName, botPath) {
     console.warn('Could not read package.json, using index.js');
   }
 
-  // Spawn the node process
   const botProcess = spawn('node', [mainScript], {
     cwd: botPath,
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe']
   });
 
-  // Save PID to a file for later management
   const pidFile = path.join(botPath, 'bot.pid');
   await fs.writeFile(pidFile, botProcess.pid.toString());
 
-  // Capture stdout/stderr for logs
   const logFile = path.join(botPath, 'bot.log');
   const logStream = fsSync.createWriteStream(logFile, { flags: 'a' });
   botProcess.stdout.pipe(logStream);
@@ -212,15 +282,12 @@ async function startBot(appName, botPath) {
 
   botProcess.unref();
 
-  // Wait a moment to see if it crashes
   await new Promise(resolve => setTimeout(resolve, 5000));
 
-  // Check if process is still running
   try {
-    process.kill(botProcess.pid, 0); // throws if not running
+    process.kill(botProcess.pid, 0);
     return { success: true, method: 'node', pid: botProcess.pid };
   } catch (err) {
-    // Process died, get last few lines of log
     let logs = '';
     try {
       logs = await fs.readFile(logFile, 'utf8');
@@ -229,7 +296,6 @@ async function startBot(appName, botPath) {
   }
 }
 
-// Stop bot by PID
 async function stopBot(appName) {
   const botPath = path.join(BOTS_DIR, appName);
   const pidFile = path.join(botPath, 'bot.pid');
@@ -238,11 +304,10 @@ async function stopBot(appName) {
     process.kill(pid, 'SIGTERM');
     await fs.unlink(pidFile);
   } catch (err) {
-    // ignore if no pid file
+    // ignore
   }
 }
 
-// Get bot logs
 async function getBotLogs(appName, lines = 50) {
   const botPath = path.join(BOTS_DIR, appName);
   const logFile = path.join(botPath, 'bot.log');
@@ -325,14 +390,12 @@ app.post('/deploy', async (req, res) => {
   const appName = customAppName || `${githubUsername}-${Date.now()}`.toLowerCase().replace(/[^a-z0-9-]/g, '');
   const botPath = path.join(BOTS_DIR, appName);
 
-  // Clone
   console.log(`Cloning ${githubUsername}/redxbot302 as ${appName}...`);
   const cloneResult = await cloneRepo(githubUsername, appName);
   if (!cloneResult.success) {
     return res.status(500).json({ error: 'Clone failed: ' + cloneResult.error });
   }
 
-  // Write .env
   const envContent = Object.entries({
     SESSION_ID: sessionId,
     OWNER_NUMBER: config.OWNER_NUMBER || '923009842133',
@@ -352,21 +415,18 @@ app.post('/deploy', async (req, res) => {
   }).map(([k, v]) => `${k}=${v}`).join('\n');
   await fs.writeFile(path.join(botPath, '.env'), envContent);
 
-  // Install dependencies
   const installResult = await installDependencies(botPath);
   if (!installResult.success) {
     await fs.rm(botPath, { recursive: true, force: true });
     return res.status(500).json({ error: installResult.error, details: installResult.details });
   }
 
-  // Start bot
   const startResult = await startBot(appName, botPath);
   if (!startResult.success) {
     await fs.rm(botPath, { recursive: true, force: true });
     return res.status(500).json({ error: 'Bot failed to start: ' + startResult.error });
   }
 
-  // Save to DB
   await pool.query(
     'INSERT INTO bots (app_name, github_username, status) VALUES ($1, $2, $3)',
     [appName, githubUsername.toLowerCase(), 'running']
@@ -394,7 +454,6 @@ app.post('/restart-app', async (req, res) => {
   const { appName } = req.body;
   const botPath = path.join(BOTS_DIR, appName);
   await stopBot(appName);
-  // Restart using same .env
   const startResult = await startBot(appName, botPath);
   if (startResult.success) {
     res.json({ success: true, message: 'Restarted' });
@@ -435,7 +494,6 @@ app.post('/update-config', async (req, res) => {
   const botPath = path.join(BOTS_DIR, appName);
   const envContent = Object.entries(config).map(([k, v]) => `${k}=${v}`).join('\n');
   await fs.writeFile(path.join(botPath, '.env'), envContent);
-  // Restart to apply new config
   await stopBot(appName);
   const startResult = await startBot(appName, botPath);
   if (startResult.success) {
