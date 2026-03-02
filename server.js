@@ -2,17 +2,15 @@ const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
 const axios = require('axios');
-const fs = require('fs').promises;
-const path = require('path');
 const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT'], allowedHeaders: ['Content-Type'] }));
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json());
 
 // -------------------- CONFIG --------------------
-let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'redx'; // mutable via admin panel
+let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'redx';
 const HEROKU_API_KEY = process.env.HEROKU_API_KEY; // Your Heroku API key
 const HEROKU_API_BASE = 'https://api.heroku.com';
 const HEROKU_HEADERS = {
@@ -27,7 +25,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// -------------------- DATABASE MIGRATION --------------------
+// -------------------- DATABASE MIGRATION (with column checks) --------------------
 async function migrateDb() {
   const client = await pool.connect();
   try {
@@ -44,11 +42,30 @@ async function migrateDb() {
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
-    // Add missing columns safely
-    await client.query(`DO $$ BEGIN ALTER TABLE users ADD COLUMN is_banned BOOLEAN DEFAULT false; EXCEPTION WHEN duplicate_column THEN END; $$;`);
-    await client.query(`DO $$ BEGIN ALTER TABLE users ADD COLUMN deployment_count INTEGER DEFAULT 0; EXCEPTION WHEN duplicate_column THEN END; $$;`);
 
-    // Bots table
+    // Add missing columns if not exist (using DO block)
+    await client.query(`
+      DO $$
+      BEGIN
+        BEGIN
+          ALTER TABLE users ADD COLUMN is_banned BOOLEAN DEFAULT false;
+        EXCEPTION
+          WHEN duplicate_column THEN RAISE NOTICE 'column is_banned already exists';
+        END;
+      END $$;
+    `);
+    await client.query(`
+      DO $$
+      BEGIN
+        BEGIN
+          ALTER TABLE users ADD COLUMN deployment_count INTEGER DEFAULT 0;
+        EXCEPTION
+          WHEN duplicate_column THEN RAISE NOTICE 'column deployment_count already exists';
+        END;
+      END $$;
+    `);
+
+    // Bots table (with heroku_app_name)
     await client.query(`
       CREATE TABLE IF NOT EXISTS bots (
         app_name TEXT PRIMARY KEY,
@@ -57,6 +74,18 @@ async function migrateDb() {
         created_at TIMESTAMP DEFAULT NOW(),
         status TEXT DEFAULT 'running'
       );
+    `);
+
+    // Add heroku_app_name if missing (for existing tables)
+    await client.query(`
+      DO $$
+      BEGIN
+        BEGIN
+          ALTER TABLE bots ADD COLUMN heroku_app_name TEXT;
+        EXCEPTION
+          WHEN duplicate_column THEN RAISE NOTICE 'column heroku_app_name already exists';
+        END;
+      END $$;
     `);
 
     // Plans table
@@ -342,7 +371,6 @@ app.post('/admin/update-password', (req, res) => {
   }
   ADMIN_PASSWORD = newPassword;
   // In production, you'd store this in an environment variable or database.
-  // For Railway, you'd need to update the environment variable via API – here we just update in memory.
   res.json({ success: true, message: 'Password updated (memory only). For permanent change, update env variable.' });
 });
 
@@ -377,12 +405,19 @@ app.post('/admin/delete-user', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { githubUsername } = req.body;
 
+  // First delete all Heroku apps for this user
   const bots = await pool.query('SELECT heroku_app_name FROM bots WHERE github_username = $1', [githubUsername.toLowerCase()]);
   for (const bot of bots.rows) {
-    try {
-      await axios.delete(`${HEROKU_API_BASE}/apps/${bot.heroku_app_name}`, { headers: HEROKU_HEADERS });
-    } catch (e) {}
+    if (bot.heroku_app_name) {
+      try {
+        await axios.delete(`${HEROKU_API_BASE}/apps/${bot.heroku_app_name}`, { headers: HEROKU_HEADERS });
+      } catch (e) {
+        console.warn(`Failed to delete Heroku app ${bot.heroku_app_name}:`, e.message);
+      }
+    }
   }
+
+  // Then delete user (bots will cascade)
   await pool.query('DELETE FROM users WHERE github_username = $1', [githubUsername.toLowerCase()]);
   res.json({ success: true });
 });
@@ -432,12 +467,13 @@ app.post('/delete-multiple-apps', async (req, res) => {
   for (const { name } of apps) {
     try {
       const bot = await pool.query('SELECT heroku_app_name FROM bots WHERE app_name = $1', [name]);
-      if (bot.rows.length) {
+      if (bot.rows.length && bot.rows[0].heroku_app_name) {
         await axios.delete(`${HEROKU_API_BASE}/apps/${bot.rows[0].heroku_app_name}`, { headers: HEROKU_HEADERS });
       }
       await pool.query('DELETE FROM bots WHERE app_name = $1', [name]);
       results.success.push(name);
-    } catch {
+    } catch (err) {
+      console.warn(`Failed to delete bot ${name}:`, err.message);
       results.failed.push(name);
     }
   }
