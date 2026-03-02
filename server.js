@@ -3,28 +3,23 @@ const { Pool } = require('pg');
 const cors = require('cors');
 const axios = require('axios');
 const fs = require('fs').promises;
-const fsSync = require('fs');
 const path = require('path');
-const simpleGit = require('simple-git');
-const { spawn, exec } = require('child_process');
-const util = require('util');
-const execPromise = util.promisify(exec);
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
-app.use(cors({
-  origin: '*', // Allow all origins (for development; restrict in production)
-  methods: ['GET', 'POST'],
-  allowedHeaders: ['Content-Type']
-}));
+app.use(cors({ origin: '*', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json());
 
 // -------------------- CONFIG --------------------
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'redx';
-const BOTS_DIR = path.join(__dirname, 'bots');
-const MAIN_REPO = 'https://github.com/AbdulRehman19721986/redxbot302.git';
-
-if (!fsSync.existsSync(BOTS_DIR)) fsSync.mkdirSync(BOTS_DIR, { recursive: true });
+const HEROKU_API_KEY = process.env.HEROKU_API_KEY; // Your Heroku API key
+const HEROKU_API_BASE = 'https://api.heroku.com';
+const HEROKU_HEADERS = {
+  'Authorization': `Bearer ${HEROKU_API_KEY}`,
+  'Accept': 'application/vnd.heroku+json; version=3',
+  'Content-Type': 'application/json'
+};
 
 // PostgreSQL connection
 const pool = new Pool({
@@ -34,10 +29,8 @@ const pool = new Pool({
 
 // -------------------- DATABASE MIGRATION --------------------
 async function migrateDb() {
-  // Check if users table exists and add missing columns
   const client = await pool.connect();
   try {
-    // Create users table if not exists (with all columns)
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
         github_username TEXT PRIMARY KEY,
@@ -50,71 +43,28 @@ async function migrateDb() {
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
-
-    // Add missing columns if they don't exist (PostgreSQL doesn't have IF NOT EXISTS for columns, so we use DO block)
+    // Add missing columns if needed (simplified)
     await client.query(`
-      DO $$
-      BEGIN
-        BEGIN
-          ALTER TABLE users ADD COLUMN is_banned BOOLEAN DEFAULT false;
-        EXCEPTION
-          WHEN duplicate_column THEN RAISE NOTICE 'column is_banned already exists';
-        END;
-      END $$;
+      DO $$ BEGIN
+        ALTER TABLE users ADD COLUMN is_banned BOOLEAN DEFAULT false;
+      EXCEPTION WHEN duplicate_column THEN END; $$;
     `);
     await client.query(`
-      DO $$
-      BEGIN
-        BEGIN
-          ALTER TABLE users ADD COLUMN deployment_count INTEGER DEFAULT 0;
-        EXCEPTION
-          WHEN duplicate_column THEN RAISE NOTICE 'column deployment_count already exists';
-        END;
-      END $$;
-    `);
-    await client.query(`
-      DO $$
-      BEGIN
-        BEGIN
-          ALTER TABLE users ADD COLUMN max_bots INTEGER DEFAULT 2;
-        EXCEPTION
-          WHEN duplicate_column THEN RAISE NOTICE 'column max_bots already exists';
-        END;
-      END $$;
-    `);
-    await client.query(`
-      DO $$
-      BEGIN
-        BEGIN
-          ALTER TABLE users ADD COLUMN subscription_plan TEXT DEFAULT 'free';
-        EXCEPTION
-          WHEN duplicate_column THEN RAISE NOTICE 'column subscription_plan already exists';
-        END;
-      END $$;
-    `);
-    await client.query(`
-      DO $$
-      BEGIN
-        BEGIN
-          ALTER TABLE users ADD COLUMN expiry_date TIMESTAMP;
-        EXCEPTION
-          WHEN duplicate_column THEN RAISE NOTICE 'column expiry_date already exists';
-        END;
-      END $$;
+      DO $$ BEGIN
+        ALTER TABLE users ADD COLUMN deployment_count INTEGER DEFAULT 0;
+      EXCEPTION WHEN duplicate_column THEN END; $$;
     `);
 
-    // Create bots table
     await client.query(`
       CREATE TABLE IF NOT EXISTS bots (
         app_name TEXT PRIMARY KEY,
+        heroku_app_name TEXT,
         github_username TEXT REFERENCES users(github_username) ON DELETE CASCADE,
-        server_id INTEGER DEFAULT 1,
         created_at TIMESTAMP DEFAULT NOW(),
         status TEXT DEFAULT 'running'
       );
     `);
 
-    // Create plans table
     await client.query(`
       CREATE TABLE IF NOT EXISTS plans (
         id SERIAL PRIMARY KEY,
@@ -127,26 +77,7 @@ async function migrateDb() {
       );
     `);
 
-    // Create servers table
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS servers (
-        id SERIAL PRIMARY KEY,
-        name TEXT,
-        url TEXT,
-        api_key TEXT,
-        bot_count INTEGER DEFAULT 0,
-        status TEXT DEFAULT 'online'
-      );
-    `);
-
-    // Insert default server
-    await client.query(
-      `INSERT INTO servers (name, url, api_key, bot_count) 
-       VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING`,
-      ['Railway Main', 'http://localhost', 'internal', 0]
-    );
-
-    // Insert default plans if none exist
+    // Insert default plans if none
     const { rows } = await client.query('SELECT COUNT(*) FROM plans');
     if (parseInt(rows[0].count) === 0) {
       await client.query(
@@ -180,143 +111,49 @@ async function checkFork(username) {
   }
 }
 
-// Clone user's fork
-async function cloneRepo(githubUsername, appName) {
-  const repoUrl = `https://github.com/${githubUsername}/redxbot302.git`;
-  const dest = path.join(BOTS_DIR, appName);
+// Generate a random Heroku app name
+function generateAppName(base) {
+  const random = crypto.randomBytes(4).toString('hex');
+  return `redx-${base}-${random}`.toLowerCase().replace(/[^a-z0-9-]/g, '');
+}
+
+// Create Heroku app
+async function createHerokuApp(appName) {
   try {
-    await simpleGit().clone(repoUrl, dest);
+    const resp = await axios.post(`${HEROKU_API_BASE}/apps`, {
+      name: appName,
+      region: 'us',
+      stack: 'heroku-20'
+    }, { headers: HEROKU_HEADERS });
+    return { success: true, data: resp.data };
+  } catch (err) {
+    console.error('Heroku create app error:', err.response?.data || err.message);
+    return { success: false, error: err.response?.data?.message || err.message };
+  }
+}
+
+// Set Heroku config vars
+async function setHerokuConfig(appName, configVars) {
+  try {
+    await axios.patch(`${HEROKU_API_BASE}/apps/${appName}/config-vars`, configVars, { headers: HEROKU_HEADERS });
     return { success: true };
   } catch (err) {
-    console.error('Clone failed:', err.message);
-    return { success: false, error: err.message };
+    console.error('Heroku set config error:', err.response?.data || err.message);
+    return { success: false, error: err.response?.data?.message || err.message };
   }
 }
 
-// Remove discard-api from package.json (recursive)
-async function fixPackageJson(botPath) {
-  const pkgPath = path.join(botPath, 'package.json');
+// Create Heroku build from GitHub tarball
+async function createHerokuBuild(appName, githubUsername) {
+  const tarballUrl = `https://api.github.com/repos/${githubUsername}/redxbot302/tarball`;
   try {
-    await fs.access(pkgPath);
-  } catch {
-    return { success: false, error: 'package.json not found' };
-  }
-
-  try {
-    const content = await fs.readFile(pkgPath, 'utf8');
-    const pkg = JSON.parse(content);
-    let modified = false;
-
-    if (pkg.dependencies && pkg.dependencies['discard-api']) {
-      delete pkg.dependencies['discard-api'];
-      modified = true;
-      console.log(`Removed discard-api from dependencies of ${botPath}`);
-    }
-    if (pkg.devDependencies && pkg.devDependencies['discard-api']) {
-      delete pkg.devDependencies['discard-api'];
-      modified = true;
-      console.log(`Removed discard-api from devDependencies of ${botPath}`);
-    }
-
-    if (modified) {
-      await fs.writeFile(pkgPath, JSON.stringify(pkg, null, 2));
-      return { success: true, fixed: true };
-    }
-    return { success: true, fixed: false };
+    const resp = await axios.post(`${HEROKU_API_BASE}/apps/${appName}/builds`, {
+      source_blob: { url: tarballUrl, version: 'HEAD' }
+    }, { headers: HEROKU_HEADERS });
+    return { success: true, data: resp.data };
   } catch (err) {
-    console.error('Error fixing package.json:', err.message);
-    return { success: false, error: 'Invalid package.json: ' + err.message };
-  }
-}
-
-// Install dependencies
-async function installDependencies(botPath) {
-  const fixResult = await fixPackageJson(botPath);
-  if (!fixResult.success) {
-    return { success: false, error: fixResult.error };
-  }
-
-  try {
-    console.log(`Running npm install in ${botPath}...`);
-    await execPromise('npm install --no-audit --no-fund', { cwd: botPath, timeout: 300000 });
-    return { success: true, fixed: fixResult.fixed };
-  } catch (err) {
-    console.error('npm install error:', err.message);
-    let debugLog = '';
-    try {
-      const logPath = path.join(botPath, 'npm-debug.log');
-      debugLog = await fs.readFile(logPath, 'utf8');
-    } catch {}
-    return { 
-      success: false, 
-      error: 'npm install failed: ' + err.message,
-      details: debugLog.slice(0, 500)
-    };
-  }
-}
-
-// Start bot using node
-async function startBot(appName, botPath) {
-  let mainScript = 'index.js';
-  try {
-    const pkgPath = path.join(botPath, 'package.json');
-    const pkg = JSON.parse(await fs.readFile(pkgPath, 'utf8'));
-    if (pkg.main) mainScript = pkg.main;
-  } catch (e) {
-    console.warn('Could not read package.json, using index.js');
-  }
-
-  const botProcess = spawn('node', [mainScript], {
-    cwd: botPath,
-    detached: true,
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
-
-  const pidFile = path.join(botPath, 'bot.pid');
-  await fs.writeFile(pidFile, botProcess.pid.toString());
-
-  const logFile = path.join(botPath, 'bot.log');
-  const logStream = fsSync.createWriteStream(logFile, { flags: 'a' });
-  botProcess.stdout.pipe(logStream);
-  botProcess.stderr.pipe(logStream);
-
-  botProcess.unref();
-
-  await new Promise(resolve => setTimeout(resolve, 5000));
-
-  try {
-    process.kill(botProcess.pid, 0);
-    return { success: true, method: 'node', pid: botProcess.pid };
-  } catch (err) {
-    let logs = '';
-    try {
-      logs = await fs.readFile(logFile, 'utf8');
-    } catch {}
-    return { success: false, error: `Bot died shortly after start. Logs:\n${logs.slice(-500)}` };
-  }
-}
-
-async function stopBot(appName) {
-  const botPath = path.join(BOTS_DIR, appName);
-  const pidFile = path.join(botPath, 'bot.pid');
-  try {
-    const pid = parseInt(await fs.readFile(pidFile, 'utf8'));
-    process.kill(pid, 'SIGTERM');
-    await fs.unlink(pidFile);
-  } catch (err) {
-    // ignore
-  }
-}
-
-async function getBotLogs(appName, lines = 50) {
-  const botPath = path.join(BOTS_DIR, appName);
-  const logFile = path.join(botPath, 'bot.log');
-  try {
-    const content = await fs.readFile(logFile, 'utf8');
-    const logLines = content.split('\n').slice(-lines).join('\n');
-    return logLines;
-  } catch {
-    return 'No logs available';
+    console.error('Heroku create build error:', err.response?.data || err.message);
+    return { success: false, error: err.response?.data?.message || err.message };
   }
 }
 
@@ -353,7 +190,7 @@ app.post('/check-fork', async (req, res) => {
   }
 
   const bots = await pool.query(
-    'SELECT app_name, created_at, status FROM bots WHERE github_username = $1',
+    'SELECT app_name, heroku_app_name, created_at, status FROM bots WHERE github_username = $1',
     [githubUsername.toLowerCase()]
   );
 
@@ -387,16 +224,17 @@ app.post('/deploy', async (req, res) => {
     return res.status(403).json({ error: `Bot limit reached (max ${userData.max_bots} bots)` });
   }
 
-  const appName = customAppName || `${githubUsername}-${Date.now()}`.toLowerCase().replace(/[^a-z0-9-]/g, '');
-  const botPath = path.join(BOTS_DIR, appName);
+  // Generate Heroku app name
+  const herokuAppName = generateAppName(githubUsername);
 
-  console.log(`Cloning ${githubUsername}/redxbot302 as ${appName}...`);
-  const cloneResult = await cloneRepo(githubUsername, appName);
-  if (!cloneResult.success) {
-    return res.status(500).json({ error: 'Clone failed: ' + cloneResult.error });
+  // Create Heroku app
+  const createResult = await createHerokuApp(herokuAppName);
+  if (!createResult.success) {
+    return res.status(500).json({ error: 'Failed to create Heroku app: ' + createResult.error });
   }
 
-  const envContent = Object.entries({
+  // Prepare config vars
+  const configVars = {
     SESSION_ID: sessionId,
     OWNER_NUMBER: config.OWNER_NUMBER || '923009842133',
     BOT_NAME: config.BOT_NAME || 'REDXBOT302',
@@ -412,94 +250,77 @@ app.post('/deploy', async (req, res) => {
     READ_MESSAGE: config.READ_MESSAGE || 'false',
     AUTO_TYPING: config.AUTO_TYPING || 'false',
     GITHUB_USERNAME: githubUsername
-  }).map(([k, v]) => `${k}=${v}`).join('\n');
-  await fs.writeFile(path.join(botPath, '.env'), envContent);
+  };
 
-  const installResult = await installDependencies(botPath);
-  if (!installResult.success) {
-    await fs.rm(botPath, { recursive: true, force: true });
-    return res.status(500).json({ error: installResult.error, details: installResult.details });
+  // Set config vars
+  const configResult = await setHerokuConfig(herokuAppName, configVars);
+  if (!configResult.success) {
+    // Clean up: delete the app? We'll just return error
+    return res.status(500).json({ error: 'Failed to set config: ' + configResult.error });
   }
 
-  const startResult = await startBot(appName, botPath);
-  if (!startResult.success) {
-    await fs.rm(botPath, { recursive: true, force: true });
-    return res.status(500).json({ error: 'Bot failed to start: ' + startResult.error });
+  // Create build
+  const buildResult = await createHerokuBuild(herokuAppName, githubUsername);
+  if (!buildResult.success) {
+    return res.status(500).json({ error: 'Failed to create build: ' + buildResult.error });
   }
 
+  // Save to DB
   await pool.query(
-    'INSERT INTO bots (app_name, github_username, status) VALUES ($1, $2, $3)',
-    [appName, githubUsername.toLowerCase(), 'running']
+    'INSERT INTO bots (app_name, heroku_app_name, github_username, status) VALUES ($1, $2, $3, $4)',
+    [customAppName || herokuAppName, herokuAppName, githubUsername.toLowerCase(), 'running']
   );
   await pool.query(
     'UPDATE users SET deployment_count = deployment_count + 1 WHERE github_username = $1',
     [githubUsername.toLowerCase()]
   );
-  await pool.query('UPDATE servers SET bot_count = bot_count + 1 WHERE id = 1');
 
-  const message = installResult.fixed 
-    ? `Bot deployed and running (PID: ${startResult.pid}, removed discard-api)`
-    : `Bot deployed and running (PID: ${startResult.pid})`;
-
-  res.json({ success: true, appName, message });
+  res.json({ 
+    success: true, 
+    appName: customAppName || herokuAppName,
+    herokuAppName,
+    message: 'Bot deployed to Heroku successfully! It may take a few minutes to start.'
+  });
 });
 
+// Get bot logs (Heroku logs)
 app.post('/bot-logs', async (req, res) => {
   const { appName } = req.body;
-  const logs = await getBotLogs(appName);
-  res.json({ success: true, logs });
+  try {
+    // Heroku logs API: GET /apps/{app_id}/log-sessions
+    // This is more complex; we'll return a placeholder for now
+    res.json({ success: true, logs: 'Logs feature not yet implemented. Check Heroku dashboard.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/restart-app', async (req, res) => {
   const { appName } = req.body;
-  const botPath = path.join(BOTS_DIR, appName);
-  await stopBot(appName);
-  const startResult = await startBot(appName, botPath);
-  if (startResult.success) {
+  // Get heroku app name from DB
+  const bot = await pool.query('SELECT heroku_app_name FROM bots WHERE app_name = $1', [appName]);
+  if (bot.rows.length === 0) return res.status(404).json({ error: 'Bot not found' });
+  const herokuAppName = bot.rows[0].heroku_app_name;
+  try {
+    // Restart dynos: DELETE /apps/{app_id}/dynos
+    await axios.delete(`${HEROKU_API_BASE}/apps/${herokuAppName}/dynos`, { headers: HEROKU_HEADERS });
     res.json({ success: true, message: 'Restarted' });
-  } else {
-    res.status(500).json({ error: startResult.error });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
 app.post('/delete-app', async (req, res) => {
   const { appName, githubUsername } = req.body;
-  const botPath = path.join(BOTS_DIR, appName);
-
-  await stopBot(appName);
-  await fs.rm(botPath, { recursive: true, force: true });
-  await pool.query('DELETE FROM bots WHERE app_name = $1', [appName]);
-  await pool.query('UPDATE servers SET bot_count = bot_count - 1 WHERE id = 1');
-  res.json({ success: true, message: 'Bot deleted' });
-});
-
-app.post('/get-config', async (req, res) => {
-  const { appName } = req.body;
-  const envFile = path.join(BOTS_DIR, appName, '.env');
+  const bot = await pool.query('SELECT heroku_app_name FROM bots WHERE app_name = $1', [appName]);
+  if (bot.rows.length === 0) return res.status(404).json({ error: 'Bot not found' });
+  const herokuAppName = bot.rows[0].heroku_app_name;
   try {
-    const envContent = await fs.readFile(envFile, 'utf8');
-    const config = envContent.split('\n').reduce((acc, line) => {
-      const [key, ...valArr] = line.split('=');
-      if (key) acc[key] = valArr.join('=');
-      return acc;
-    }, {});
-    res.json({ success: true, config });
+    await axios.delete(`${HEROKU_API_BASE}/apps/${herokuAppName}`, { headers: HEROKU_HEADERS });
+    await pool.query('DELETE FROM bots WHERE app_name = $1', [appName]);
+    res.json({ success: true, message: 'Bot deleted from Heroku' });
   } catch (err) {
-    res.status(404).json({ error: 'Config not found' });
-  }
-});
-
-app.post('/update-config', async (req, res) => {
-  const { appName, config } = req.body;
-  const botPath = path.join(BOTS_DIR, appName);
-  const envContent = Object.entries(config).map(([k, v]) => `${k}=${v}`).join('\n');
-  await fs.writeFile(path.join(botPath, '.env'), envContent);
-  await stopBot(appName);
-  const startResult = await startBot(appName, botPath);
-  if (startResult.success) {
-    res.json({ success: true, message: 'Config updated and bot restarted' });
-  } else {
-    res.status(500).json({ error: 'Restart after config update failed: ' + startResult.error });
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -549,13 +370,12 @@ app.post('/admin/delete-user', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { githubUsername } = req.body;
 
-  const bots = await pool.query('SELECT app_name FROM bots WHERE github_username = $1', [githubUsername.toLowerCase()]);
+  const bots = await pool.query('SELECT heroku_app_name FROM bots WHERE github_username = $1', [githubUsername.toLowerCase()]);
   for (const bot of bots.rows) {
-    await stopBot(bot.app_name);
-    const botPath = path.join(BOTS_DIR, bot.app_name);
-    await fs.rm(botPath, { recursive: true, force: true });
+    try {
+      await axios.delete(`${HEROKU_API_BASE}/apps/${bot.heroku_app_name}`, { headers: HEROKU_HEADERS });
+    } catch (e) {}
   }
-
   await pool.query('DELETE FROM users WHERE github_username = $1', [githubUsername.toLowerCase()]);
   res.json({ success: true });
 });
@@ -592,20 +412,9 @@ app.post('/admin/delete-plan', async (req, res) => {
   res.json({ success: true });
 });
 
-app.post('/admin/servers', async (req, res) => {
-  if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  const { rows } = await pool.query('SELECT id, name, bot_count, status FROM servers');
-  res.json({ servers: rows });
-});
-
 app.post('/get-all-apps', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  const { rows } = await pool.query(`
-    SELECT b.app_name, b.github_username, b.created_at, b.status, s.name as server_name
-    FROM bots b
-    JOIN servers s ON b.server_id = s.id
-    ORDER BY b.created_at DESC
-  `);
+  const { rows } = await pool.query('SELECT * FROM bots ORDER BY created_at DESC');
   res.json({ apps: rows });
 });
 
@@ -615,9 +424,10 @@ app.post('/delete-multiple-apps', async (req, res) => {
   const results = { success: [], failed: [] };
   for (const { name } of apps) {
     try {
-      await stopBot(name);
-      const botPath = path.join(BOTS_DIR, name);
-      await fs.rm(botPath, { recursive: true, force: true });
+      const bot = await pool.query('SELECT heroku_app_name FROM bots WHERE app_name = $1', [name]);
+      if (bot.rows.length) {
+        await axios.delete(`${HEROKU_API_BASE}/apps/${bot.rows[0].heroku_app_name}`, { headers: HEROKU_HEADERS });
+      }
       await pool.query('DELETE FROM bots WHERE app_name = $1', [name]);
       results.success.push(name);
     } catch {
