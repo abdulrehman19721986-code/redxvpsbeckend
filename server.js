@@ -12,7 +12,7 @@ app.use(express.json());
 // -------------------- CONFIG --------------------
 let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'redx';
 const RAILWAY_TOKEN = process.env.RAILWAY_TOKEN || 'ac073eb8-36dd-4bf6-a4d2-d83445367615';
-const RAILWAY_API = 'https://backboard.railway.app/graphql/v2'; // Railway GraphQL endpoint
+const RAILWAY_API = 'https://backboard.railway.app/graphql/v2';
 
 // PostgreSQL connection
 const pool = new Pool({
@@ -107,7 +107,7 @@ async function checkFork(username) {
   }
 }
 
-// Railway GraphQL helper
+// Railway GraphQL helper with detailed error
 async function railwayGraphQL(query, variables = {}) {
   try {
     const response = await axios.post(RAILWAY_API, {
@@ -120,17 +120,32 @@ async function railwayGraphQL(query, variables = {}) {
       }
     });
     if (response.data.errors) {
-      throw new Error(response.data.errors.map(e => e.message).join(', '));
+      const errorMessages = response.data.errors.map(e => e.message).join('; ');
+      throw new Error(`GraphQL errors: ${errorMessages}`);
     }
     return response.data.data;
   } catch (err) {
-    console.error('Railway API error:', err.response?.data || err.message);
+    if (err.response) {
+      // The request was made and the server responded with a status code outside 2xx
+      console.error('Railway API response error:', {
+        status: err.response.status,
+        data: err.response.data
+      });
+    } else if (err.request) {
+      console.error('Railway API no response:', err.request);
+    } else {
+      console.error('Railway API error:', err.message);
+    }
     throw err;
   }
 }
 
-// Create Railway project
-async function createRailwayProject(projectName) {
+// Create Railway project with unique name
+async function createRailwayProject(baseName) {
+  // Ensure name is valid: lowercase, alphanumeric and hyphens only
+  const safeBase = baseName.toLowerCase().replace(/[^a-z0-9-]/g, '');
+  const projectName = `${safeBase}-${crypto.randomBytes(4).toString('hex')}`;
+
   const query = `
     mutation CreateProject($name: String!) {
       projectCreate(input: { name: $name }) {
@@ -163,16 +178,6 @@ async function setRailwayVariables(projectId, envVars) {
   }));
   const data = await railwayGraphQL(query, { projectId, variables });
   return data.variableCollectionUpsert;
-}
-
-// Deploy from GitHub repo (trigger a deployment)
-async function deployFromGitHub(projectId, repoUrl, branch = 'main') {
-  // This is simplified – Railway may automatically deploy when repo is connected.
-  // You might need to create a deployment source first.
-  // For now, we'll assume the project is already connected to GitHub.
-  // If not, you'd need to create a source via the API.
-  console.log(`Triggering deployment for project ${projectId} from ${repoUrl}`);
-  return { success: true };
 }
 
 // -------------------- ROOT ROUTE --------------------
@@ -251,11 +256,11 @@ app.post('/deploy', async (req, res) => {
     return res.status(403).json({ error: `Bot limit reached (max ${userData.max_bots} bots)` });
   }
 
-  const projectName = customAppName || `redx-${githubUsername}-${Date.now()}`.toLowerCase().replace(/[^a-z0-9-]/g, '');
+  const baseName = customAppName || `redx-${githubUsername}`;
 
   try {
-    // 1. Create Railway project
-    const project = await createRailwayProject(projectName);
+    // 1. Create Railway project with unique name
+    const project = await createRailwayProject(baseName);
 
     // 2. Set environment variables
     const envVars = {
@@ -277,15 +282,10 @@ app.post('/deploy', async (req, res) => {
     };
     await setRailwayVariables(project.id, envVars);
 
-    // 3. Trigger deployment (you may need to connect GitHub repo first)
-    // For simplicity, we assume the project is already linked to the repo.
-    // In practice, you'd use a GitHub integration or deploy from a public repo URL.
-    // This part depends on how your bot is set up to deploy.
-
-    // Save to DB
+    // 3. Save to DB
     await pool.query(
       'INSERT INTO bots (app_name, railway_project_id, github_username, status) VALUES ($1, $2, $3, $4)',
-      [projectName, project.id, githubUsername.toLowerCase(), 'running']
+      [baseName, project.id, githubUsername.toLowerCase(), 'running']
     );
     await pool.query(
       'UPDATE users SET deployment_count = deployment_count + 1 WHERE github_username = $1',
@@ -294,14 +294,19 @@ app.post('/deploy', async (req, res) => {
 
     res.json({ 
       success: true, 
-      appName: projectName,
+      appName: baseName,
       railwayProjectId: project.id,
       message: 'Bot deployed to Railway successfully! It may take a few minutes to start.'
     });
 
   } catch (error) {
     console.error('Deployment error:', error);
-    res.status(500).json({ error: 'Failed to deploy to Railway: ' + error.message });
+    // Send detailed error to frontend
+    res.status(500).json({ 
+      error: 'Failed to deploy to Railway', 
+      details: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
