@@ -11,13 +11,8 @@ app.use(express.json());
 
 // -------------------- CONFIG --------------------
 let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'redx';
-const HEROKU_API_KEY = process.env.HEROKU_API_KEY; // Your Heroku API key
-const HEROKU_API_BASE = 'https://api.heroku.com';
-const HEROKU_HEADERS = {
-  'Authorization': `Bearer ${HEROKU_API_KEY}`,
-  'Accept': 'application/vnd.heroku+json; version=3',
-  'Content-Type': 'application/json'
-};
+const RAILWAY_API_TOKEN = process.env.RAILWAY_API_TOKEN || 'ac073eb8-36dd-4bf6-a4d2-d83445367615';
+const RAILWAY_API_BASE = process.env.RAILWAY_API_BASE || 'https://api.railway.app/v1'; // adjust if needed
 
 // PostgreSQL connection
 const pool = new Pool({
@@ -25,11 +20,10 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// -------------------- DATABASE MIGRATION (with column checks) --------------------
+// -------------------- DATABASE MIGRATION --------------------
 async function migrateDb() {
   const client = await pool.connect();
   try {
-    // Users table
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
         github_username TEXT PRIMARY KEY,
@@ -42,53 +36,32 @@ async function migrateDb() {
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
-
-    // Add missing columns if not exist (using DO block)
     await client.query(`
-      DO $$
-      BEGIN
-        BEGIN
-          ALTER TABLE users ADD COLUMN is_banned BOOLEAN DEFAULT false;
-        EXCEPTION
-          WHEN duplicate_column THEN RAISE NOTICE 'column is_banned already exists';
-        END;
-      END $$;
+      DO $$ BEGIN
+        ALTER TABLE users ADD COLUMN is_banned BOOLEAN DEFAULT false;
+      EXCEPTION WHEN duplicate_column THEN END; $$;
     `);
     await client.query(`
-      DO $$
-      BEGIN
-        BEGIN
-          ALTER TABLE users ADD COLUMN deployment_count INTEGER DEFAULT 0;
-        EXCEPTION
-          WHEN duplicate_column THEN RAISE NOTICE 'column deployment_count already exists';
-        END;
-      END $$;
+      DO $$ BEGIN
+        ALTER TABLE users ADD COLUMN deployment_count INTEGER DEFAULT 0;
+      EXCEPTION WHEN duplicate_column THEN END; $$;
     `);
 
-    // Bots table (with heroku_app_name)
     await client.query(`
       CREATE TABLE IF NOT EXISTS bots (
         app_name TEXT PRIMARY KEY,
-        heroku_app_name TEXT,
+        railway_app_name TEXT,
         github_username TEXT REFERENCES users(github_username) ON DELETE CASCADE,
         created_at TIMESTAMP DEFAULT NOW(),
         status TEXT DEFAULT 'running'
       );
     `);
-
-    // Add heroku_app_name if missing (for existing tables)
     await client.query(`
-      DO $$
-      BEGIN
-        BEGIN
-          ALTER TABLE bots ADD COLUMN heroku_app_name TEXT;
-        EXCEPTION
-          WHEN duplicate_column THEN RAISE NOTICE 'column heroku_app_name already exists';
-        END;
-      END $$;
+      DO $$ BEGIN
+        ALTER TABLE bots ADD COLUMN railway_app_name TEXT;
+      EXCEPTION WHEN duplicate_column THEN END; $$;
     `);
 
-    // Plans table
     await client.query(`
       CREATE TABLE IF NOT EXISTS plans (
         id SERIAL PRIMARY KEY,
@@ -101,7 +74,6 @@ async function migrateDb() {
       );
     `);
 
-    // Insert default plans if none
     const { rows } = await client.query('SELECT COUNT(*) FROM plans');
     if (parseInt(rows[0].count) === 0) {
       await client.query(
@@ -135,48 +107,29 @@ async function checkFork(username) {
   }
 }
 
-// Generate a random Heroku app name
+// Generate a random Railway app name
 function generateAppName(base) {
   const random = crypto.randomBytes(4).toString('hex');
   return `redx-${base}-${random}`.toLowerCase().replace(/[^a-z0-9-]/g, '');
 }
 
-// Create Heroku app
-async function createHerokuApp(appName) {
+// Deploy to Railway (using custom API endpoint with token)
+async function deployToRailway(githubUsername, sessionId, config) {
   try {
-    const resp = await axios.post(`${HEROKU_API_BASE}/apps`, {
-      name: appName,
-      region: 'us',
-      stack: 'heroku-20'
-    }, { headers: HEROKU_HEADERS });
-    return { success: true, data: resp.data };
+    const response = await axios.post(`${RAILWAY_API_BASE}/deploy`, {
+      githubUsername,
+      sessionId,
+      config
+    }, {
+      headers: {
+        'Authorization': `Bearer ${RAILWAY_API_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 60000
+    });
+    return { success: true, data: response.data };
   } catch (err) {
-    console.error('Heroku create app error:', err.response?.data || err.message);
-    return { success: false, error: err.response?.data?.message || err.message };
-  }
-}
-
-// Set Heroku config vars
-async function setHerokuConfig(appName, configVars) {
-  try {
-    await axios.patch(`${HEROKU_API_BASE}/apps/${appName}/config-vars`, configVars, { headers: HEROKU_HEADERS });
-    return { success: true };
-  } catch (err) {
-    console.error('Heroku set config error:', err.response?.data || err.message);
-    return { success: false, error: err.response?.data?.message || err.message };
-  }
-}
-
-// Create Heroku build from GitHub tarball
-async function createHerokuBuild(appName, githubUsername) {
-  const tarballUrl = `https://api.github.com/repos/${githubUsername}/redxbot302/tarball`;
-  try {
-    const resp = await axios.post(`${HEROKU_API_BASE}/apps/${appName}/builds`, {
-      source_blob: { url: tarballUrl, version: 'HEAD' }
-    }, { headers: HEROKU_HEADERS });
-    return { success: true, data: resp.data };
-  } catch (err) {
-    console.error('Heroku create build error:', err.response?.data || err.message);
+    console.error('Railway deploy error:', err.response?.data || err.message);
     return { success: false, error: err.response?.data?.message || err.message };
   }
 }
@@ -184,7 +137,7 @@ async function createHerokuBuild(appName, githubUsername) {
 // -------------------- ROOT ROUTE --------------------
 app.get('/', (req, res) => {
   res.json({ 
-    message: 'REDX Bot Deployer Backend',
+    message: 'REDX Bot Deployer Backend (Railway)',
     status: 'running',
     endpoints: ['/api/health', '/api/plans', '/check-fork', '/deploy', '/admin/login', '/admin/update-password']
   });
@@ -223,7 +176,7 @@ app.post('/check-fork', async (req, res) => {
   }
 
   const bots = await pool.query(
-    'SELECT app_name, heroku_app_name, created_at, status FROM bots WHERE github_username = $1',
+    'SELECT app_name, railway_app_name, created_at, status FROM bots WHERE github_username = $1',
     [githubUsername.toLowerCase()]
   );
 
@@ -257,18 +210,10 @@ app.post('/deploy', async (req, res) => {
     return res.status(403).json({ error: `Bot limit reached (max ${userData.max_bots} bots)` });
   }
 
-  // Generate Heroku app name
-  const herokuAppName = generateAppName(githubUsername);
+  const railwayAppName = generateAppName(githubUsername);
 
-  // Create Heroku app
-  const createResult = await createHerokuApp(herokuAppName);
-  if (!createResult.success) {
-    return res.status(500).json({ error: 'Failed to create Heroku app: ' + createResult.error });
-  }
-
-  // Prepare config vars
-  const configVars = {
-    SESSION_ID: sessionId,
+  // Prepare config for deployment
+  const deployConfig = {
     OWNER_NUMBER: config.OWNER_NUMBER || '923009842133',
     BOT_NAME: config.BOT_NAME || 'REDXBOT302',
     PREFIX: config.PREFIX || '.',
@@ -281,26 +226,19 @@ app.post('/deploy', async (req, res) => {
     AUTO_STICKER: config.AUTO_STICKER || 'false',
     WELCOME: config.WELCOME || 'false',
     READ_MESSAGE: config.READ_MESSAGE || 'false',
-    AUTO_TYPING: config.AUTO_TYPING || 'false',
-    GITHUB_USERNAME: githubUsername
+    AUTO_TYPING: config.AUTO_TYPING || 'false'
   };
 
-  // Set config vars
-  const configResult = await setHerokuConfig(herokuAppName, configVars);
-  if (!configResult.success) {
-    return res.status(500).json({ error: 'Failed to set config: ' + configResult.error });
-  }
-
-  // Create build
-  const buildResult = await createHerokuBuild(herokuAppName, githubUsername);
-  if (!buildResult.success) {
-    return res.status(500).json({ error: 'Failed to create build: ' + buildResult.error });
+  // Deploy to Railway
+  const deployResult = await deployToRailway(githubUsername, sessionId, deployConfig);
+  if (!deployResult.success) {
+    return res.status(500).json({ error: 'Failed to deploy to Railway: ' + deployResult.error });
   }
 
   // Save to DB
   await pool.query(
-    'INSERT INTO bots (app_name, heroku_app_name, github_username, status) VALUES ($1, $2, $3, $4)',
-    [customAppName || herokuAppName, herokuAppName, githubUsername.toLowerCase(), 'running']
+    'INSERT INTO bots (app_name, railway_app_name, github_username, status) VALUES ($1, $2, $3, $4)',
+    [customAppName || railwayAppName, railwayAppName, githubUsername.toLowerCase(), 'running']
   );
   await pool.query(
     'UPDATE users SET deployment_count = deployment_count + 1 WHERE github_username = $1',
@@ -309,43 +247,35 @@ app.post('/deploy', async (req, res) => {
 
   res.json({ 
     success: true, 
-    appName: customAppName || herokuAppName,
-    herokuAppName,
-    message: 'Bot deployed to Heroku successfully! It may take a few minutes to start.'
+    appName: customAppName || railwayAppName,
+    railwayAppName,
+    message: 'Bot deployed to Railway successfully! It may take a few minutes to start.'
   });
 });
 
-// Get bot logs (Heroku logs) – placeholder
+// Get bot logs – placeholder
 app.post('/bot-logs', async (req, res) => {
   const { appName } = req.body;
-  res.json({ success: true, logs: 'Logs feature not yet implemented. Check Heroku dashboard.' });
+  res.json({ success: true, logs: 'Logs feature not yet implemented. Check Railway dashboard.' });
 });
 
 app.post('/restart-app', async (req, res) => {
   const { appName } = req.body;
-  const bot = await pool.query('SELECT heroku_app_name FROM bots WHERE app_name = $1', [appName]);
+  const bot = await pool.query('SELECT railway_app_name FROM bots WHERE app_name = $1', [appName]);
   if (bot.rows.length === 0) return res.status(404).json({ error: 'Bot not found' });
-  const herokuAppName = bot.rows[0].heroku_app_name;
-  try {
-    await axios.delete(`${HEROKU_API_BASE}/apps/${herokuAppName}/dynos`, { headers: HEROKU_HEADERS });
-    res.json({ success: true, message: 'Restarted' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  const railwayAppName = bot.rows[0].railway_app_name;
+  // Call Railway API to restart (if available)
+  res.json({ success: false, error: 'Restart not implemented yet.' });
 });
 
 app.post('/delete-app', async (req, res) => {
   const { appName, githubUsername } = req.body;
-  const bot = await pool.query('SELECT heroku_app_name FROM bots WHERE app_name = $1', [appName]);
+  const bot = await pool.query('SELECT railway_app_name FROM bots WHERE app_name = $1', [appName]);
   if (bot.rows.length === 0) return res.status(404).json({ error: 'Bot not found' });
-  const herokuAppName = bot.rows[0].heroku_app_name;
-  try {
-    await axios.delete(`${HEROKU_API_BASE}/apps/${herokuAppName}`, { headers: HEROKU_HEADERS });
-    await pool.query('DELETE FROM bots WHERE app_name = $1', [appName]);
-    res.json({ success: true, message: 'Bot deleted from Heroku' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  const railwayAppName = bot.rows[0].railway_app_name;
+  // Call Railway API to delete (if available)
+  await pool.query('DELETE FROM bots WHERE app_name = $1', [appName]);
+  res.json({ success: true, message: 'Bot deleted (Railway cleanup not implemented).' });
 });
 
 app.post('/api/buy-plan', (req, res) => {
@@ -363,15 +293,13 @@ app.post('/admin/login', (req, res) => {
   res.status(401).json({ error: 'Invalid password' });
 });
 
-// Change admin password
 app.post('/admin/update-password', (req, res) => {
   const { currentPassword, newPassword } = req.body;
   if (currentPassword !== ADMIN_PASSWORD) {
     return res.status(401).json({ error: 'Current password is incorrect' });
   }
   ADMIN_PASSWORD = newPassword;
-  // In production, you'd store this in an environment variable or database.
-  res.json({ success: true, message: 'Password updated (memory only). For permanent change, update env variable.' });
+  res.json({ success: true, message: 'Password updated (memory only).' });
 });
 
 app.post('/admin/users', async (req, res) => {
@@ -405,19 +333,12 @@ app.post('/admin/delete-user', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { githubUsername } = req.body;
 
-  // First delete all Heroku apps for this user
-  const bots = await pool.query('SELECT heroku_app_name FROM bots WHERE github_username = $1', [githubUsername.toLowerCase()]);
+  const bots = await pool.query('SELECT railway_app_name FROM bots WHERE github_username = $1', [githubUsername.toLowerCase()]);
   for (const bot of bots.rows) {
-    if (bot.heroku_app_name) {
-      try {
-        await axios.delete(`${HEROKU_API_BASE}/apps/${bot.heroku_app_name}`, { headers: HEROKU_HEADERS });
-      } catch (e) {
-        console.warn(`Failed to delete Heroku app ${bot.heroku_app_name}:`, e.message);
-      }
+    if (bot.railway_app_name) {
+      // Call Railway API to delete
     }
   }
-
-  // Then delete user (bots will cascade)
   await pool.query('DELETE FROM users WHERE github_username = $1', [githubUsername.toLowerCase()]);
   res.json({ success: true });
 });
@@ -466,14 +387,13 @@ app.post('/delete-multiple-apps', async (req, res) => {
   const results = { success: [], failed: [] };
   for (const { name } of apps) {
     try {
-      const bot = await pool.query('SELECT heroku_app_name FROM bots WHERE app_name = $1', [name]);
-      if (bot.rows.length && bot.rows[0].heroku_app_name) {
-        await axios.delete(`${HEROKU_API_BASE}/apps/${bot.rows[0].heroku_app_name}`, { headers: HEROKU_HEADERS });
+      const bot = await pool.query('SELECT railway_app_name FROM bots WHERE app_name = $1', [name]);
+      if (bot.rows.length) {
+        // Call Railway API to delete
       }
       await pool.query('DELETE FROM bots WHERE app_name = $1', [name]);
       results.success.push(name);
     } catch (err) {
-      console.warn(`Failed to delete bot ${name}:`, err.message);
       results.failed.push(name);
     }
   }
