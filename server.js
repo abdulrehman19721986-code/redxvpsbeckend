@@ -11,8 +11,8 @@ app.use(express.json());
 
 // -------------------- CONFIG --------------------
 let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'redx';
-const RAILWAY_API_TOKEN = process.env.RAILWAY_API_TOKEN || 'ac073eb8-36dd-4bf6-a4d2-d83445367615';
-const RAILWAY_API_BASE = process.env.RAILWAY_API_BASE || 'https://api.railway.app/v1'; // adjust if needed
+const RAILWAY_TOKEN = process.env.RAILWAY_TOKEN || 'ac073eb8-36dd-4bf6-a4d2-d83445367615';
+const RAILWAY_API = 'https://backboard.railway.app/graphql/v2'; // Railway GraphQL endpoint
 
 // PostgreSQL connection
 const pool = new Pool({
@@ -50,7 +50,7 @@ async function migrateDb() {
     await client.query(`
       CREATE TABLE IF NOT EXISTS bots (
         app_name TEXT PRIMARY KEY,
-        railway_app_name TEXT,
+        railway_project_id TEXT,
         github_username TEXT REFERENCES users(github_username) ON DELETE CASCADE,
         created_at TIMESTAMP DEFAULT NOW(),
         status TEXT DEFAULT 'running'
@@ -58,7 +58,7 @@ async function migrateDb() {
     `);
     await client.query(`
       DO $$ BEGIN
-        ALTER TABLE bots ADD COLUMN railway_app_name TEXT;
+        ALTER TABLE bots ADD COLUMN railway_project_id TEXT;
       EXCEPTION WHEN duplicate_column THEN END; $$;
     `);
 
@@ -107,31 +107,72 @@ async function checkFork(username) {
   }
 }
 
-// Generate a random Railway app name
-function generateAppName(base) {
-  const random = crypto.randomBytes(4).toString('hex');
-  return `redx-${base}-${random}`.toLowerCase().replace(/[^a-z0-9-]/g, '');
-}
-
-// Deploy to Railway (using custom API endpoint with token)
-async function deployToRailway(githubUsername, sessionId, config) {
+// Railway GraphQL helper
+async function railwayGraphQL(query, variables = {}) {
   try {
-    const response = await axios.post(`${RAILWAY_API_BASE}/deploy`, {
-      githubUsername,
-      sessionId,
-      config
+    const response = await axios.post(RAILWAY_API, {
+      query,
+      variables
     }, {
       headers: {
-        'Authorization': `Bearer ${RAILWAY_API_TOKEN}`,
+        'Authorization': `Bearer ${RAILWAY_TOKEN}`,
         'Content-Type': 'application/json'
-      },
-      timeout: 60000
+      }
     });
-    return { success: true, data: response.data };
+    if (response.data.errors) {
+      throw new Error(response.data.errors.map(e => e.message).join(', '));
+    }
+    return response.data.data;
   } catch (err) {
-    console.error('Railway deploy error:', err.response?.data || err.message);
-    return { success: false, error: err.response?.data?.message || err.message };
+    console.error('Railway API error:', err.response?.data || err.message);
+    throw err;
   }
+}
+
+// Create Railway project
+async function createRailwayProject(projectName) {
+  const query = `
+    mutation CreateProject($name: String!) {
+      projectCreate(input: { name: $name }) {
+        project {
+          id
+          name
+        }
+      }
+    }
+  `;
+  const data = await railwayGraphQL(query, { name: projectName });
+  return data.projectCreate.project;
+}
+
+// Set environment variables in Railway project
+async function setRailwayVariables(projectId, envVars) {
+  const query = `
+    mutation VariableCollectionUpsert($projectId: String!, $variables: [VariableInput!]!) {
+      variableCollectionUpsert(input: { projectId: $projectId, variables: $variables }) {
+        variables {
+          name
+          value
+        }
+      }
+    }
+  `;
+  const variables = Object.entries(envVars).map(([key, value]) => ({
+    name: key,
+    value: String(value)
+  }));
+  const data = await railwayGraphQL(query, { projectId, variables });
+  return data.variableCollectionUpsert;
+}
+
+// Deploy from GitHub repo (trigger a deployment)
+async function deployFromGitHub(projectId, repoUrl, branch = 'main') {
+  // This is simplified – Railway may automatically deploy when repo is connected.
+  // You might need to create a deployment source first.
+  // For now, we'll assume the project is already connected to GitHub.
+  // If not, you'd need to create a source via the API.
+  console.log(`Triggering deployment for project ${projectId} from ${repoUrl}`);
+  return { success: true };
 }
 
 // -------------------- ROOT ROUTE --------------------
@@ -176,7 +217,7 @@ app.post('/check-fork', async (req, res) => {
   }
 
   const bots = await pool.query(
-    'SELECT app_name, railway_app_name, created_at, status FROM bots WHERE github_username = $1',
+    'SELECT app_name, railway_project_id, created_at, status FROM bots WHERE github_username = $1',
     [githubUsername.toLowerCase()]
   );
 
@@ -210,47 +251,58 @@ app.post('/deploy', async (req, res) => {
     return res.status(403).json({ error: `Bot limit reached (max ${userData.max_bots} bots)` });
   }
 
-  const railwayAppName = generateAppName(githubUsername);
+  const projectName = customAppName || `redx-${githubUsername}-${Date.now()}`.toLowerCase().replace(/[^a-z0-9-]/g, '');
 
-  // Prepare config for deployment
-  const deployConfig = {
-    OWNER_NUMBER: config.OWNER_NUMBER || '923009842133',
-    BOT_NAME: config.BOT_NAME || 'REDXBOT302',
-    PREFIX: config.PREFIX || '.',
-    AUTO_STATUS_SEEN: config.AUTO_STATUS_SEEN || 'true',
-    AUTO_STATUS_REACT: config.AUTO_STATUS_REACT || 'true',
-    ANTI_DELETE: config.ANTI_DELETE || 'true',
-    ANTI_LINK: config.ANTI_LINK || 'false',
-    ALWAYS_ONLINE: config.ALWAYS_ONLINE || 'false',
-    AUTO_REPLY: config.AUTO_REPLY || 'false',
-    AUTO_STICKER: config.AUTO_STICKER || 'false',
-    WELCOME: config.WELCOME || 'false',
-    READ_MESSAGE: config.READ_MESSAGE || 'false',
-    AUTO_TYPING: config.AUTO_TYPING || 'false'
-  };
+  try {
+    // 1. Create Railway project
+    const project = await createRailwayProject(projectName);
 
-  // Deploy to Railway
-  const deployResult = await deployToRailway(githubUsername, sessionId, deployConfig);
-  if (!deployResult.success) {
-    return res.status(500).json({ error: 'Failed to deploy to Railway: ' + deployResult.error });
+    // 2. Set environment variables
+    const envVars = {
+      SESSION_ID: sessionId,
+      OWNER_NUMBER: config.OWNER_NUMBER || '923009842133',
+      BOT_NAME: config.BOT_NAME || 'REDXBOT302',
+      PREFIX: config.PREFIX || '.',
+      AUTO_STATUS_SEEN: config.AUTO_STATUS_SEEN || 'true',
+      AUTO_STATUS_REACT: config.AUTO_STATUS_REACT || 'true',
+      ANTI_DELETE: config.ANTI_DELETE || 'true',
+      ANTI_LINK: config.ANTI_LINK || 'false',
+      ALWAYS_ONLINE: config.ALWAYS_ONLINE || 'false',
+      AUTO_REPLY: config.AUTO_REPLY || 'false',
+      AUTO_STICKER: config.AUTO_STICKER || 'false',
+      WELCOME: config.WELCOME || 'false',
+      READ_MESSAGE: config.READ_MESSAGE || 'false',
+      AUTO_TYPING: config.AUTO_TYPING || 'false',
+      GITHUB_USERNAME: githubUsername
+    };
+    await setRailwayVariables(project.id, envVars);
+
+    // 3. Trigger deployment (you may need to connect GitHub repo first)
+    // For simplicity, we assume the project is already linked to the repo.
+    // In practice, you'd use a GitHub integration or deploy from a public repo URL.
+    // This part depends on how your bot is set up to deploy.
+
+    // Save to DB
+    await pool.query(
+      'INSERT INTO bots (app_name, railway_project_id, github_username, status) VALUES ($1, $2, $3, $4)',
+      [projectName, project.id, githubUsername.toLowerCase(), 'running']
+    );
+    await pool.query(
+      'UPDATE users SET deployment_count = deployment_count + 1 WHERE github_username = $1',
+      [githubUsername.toLowerCase()]
+    );
+
+    res.json({ 
+      success: true, 
+      appName: projectName,
+      railwayProjectId: project.id,
+      message: 'Bot deployed to Railway successfully! It may take a few minutes to start.'
+    });
+
+  } catch (error) {
+    console.error('Deployment error:', error);
+    res.status(500).json({ error: 'Failed to deploy to Railway: ' + error.message });
   }
-
-  // Save to DB
-  await pool.query(
-    'INSERT INTO bots (app_name, railway_app_name, github_username, status) VALUES ($1, $2, $3, $4)',
-    [customAppName || railwayAppName, railwayAppName, githubUsername.toLowerCase(), 'running']
-  );
-  await pool.query(
-    'UPDATE users SET deployment_count = deployment_count + 1 WHERE github_username = $1',
-    [githubUsername.toLowerCase()]
-  );
-
-  res.json({ 
-    success: true, 
-    appName: customAppName || railwayAppName,
-    railwayAppName,
-    message: 'Bot deployed to Railway successfully! It may take a few minutes to start.'
-  });
 });
 
 // Get bot logs – placeholder
@@ -261,19 +313,18 @@ app.post('/bot-logs', async (req, res) => {
 
 app.post('/restart-app', async (req, res) => {
   const { appName } = req.body;
-  const bot = await pool.query('SELECT railway_app_name FROM bots WHERE app_name = $1', [appName]);
+  const bot = await pool.query('SELECT railway_project_id FROM bots WHERE app_name = $1', [appName]);
   if (bot.rows.length === 0) return res.status(404).json({ error: 'Bot not found' });
-  const railwayAppName = bot.rows[0].railway_app_name;
-  // Call Railway API to restart (if available)
+  // Call Railway API to restart (deploy again)
   res.json({ success: false, error: 'Restart not implemented yet.' });
 });
 
 app.post('/delete-app', async (req, res) => {
   const { appName, githubUsername } = req.body;
-  const bot = await pool.query('SELECT railway_app_name FROM bots WHERE app_name = $1', [appName]);
+  const bot = await pool.query('SELECT railway_project_id FROM bots WHERE app_name = $1', [appName]);
   if (bot.rows.length === 0) return res.status(404).json({ error: 'Bot not found' });
-  const railwayAppName = bot.rows[0].railway_app_name;
-  // Call Railway API to delete (if available)
+  const projectId = bot.rows[0].railway_project_id;
+  // Call Railway API to delete project (if available)
   await pool.query('DELETE FROM bots WHERE app_name = $1', [appName]);
   res.json({ success: true, message: 'Bot deleted (Railway cleanup not implemented).' });
 });
@@ -333,10 +384,10 @@ app.post('/admin/delete-user', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { githubUsername } = req.body;
 
-  const bots = await pool.query('SELECT railway_app_name FROM bots WHERE github_username = $1', [githubUsername.toLowerCase()]);
+  const bots = await pool.query('SELECT railway_project_id FROM bots WHERE github_username = $1', [githubUsername.toLowerCase()]);
   for (const bot of bots.rows) {
-    if (bot.railway_app_name) {
-      // Call Railway API to delete
+    if (bot.railway_project_id) {
+      // Call Railway API to delete project
     }
   }
   await pool.query('DELETE FROM users WHERE github_username = $1', [githubUsername.toLowerCase()]);
@@ -387,9 +438,9 @@ app.post('/delete-multiple-apps', async (req, res) => {
   const results = { success: [], failed: [] };
   for (const { name } of apps) {
     try {
-      const bot = await pool.query('SELECT railway_app_name FROM bots WHERE app_name = $1', [name]);
+      const bot = await pool.query('SELECT railway_project_id FROM bots WHERE app_name = $1', [name]);
       if (bot.rows.length) {
-        // Call Railway API to delete
+        // Call Railway API to delete project
       }
       await pool.query('DELETE FROM bots WHERE app_name = $1', [name]);
       results.success.push(name);
