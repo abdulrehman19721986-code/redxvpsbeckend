@@ -18,7 +18,7 @@ const HEROKU_API = 'https://api.heroku.com';
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  family: 4   // ✅ Force IPv4
+  family: 4   // ✅ Force IPv4 to avoid ENETUNREACH
 });
 
 // -------------------- DATABASE MIGRATION --------------------
@@ -111,8 +111,6 @@ async function migrateDb() {
     client.release();
   }
 }
-
-// Run migration immediately
 migrateDb().catch(console.error);
 
 // -------------------- HELPER FUNCTIONS --------------------
