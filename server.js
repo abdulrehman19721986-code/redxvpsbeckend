@@ -24,7 +24,7 @@ const pool = new Pool({
 async function migrateDb() {
   const client = await pool.connect();
   try {
-    // Users table (same as before)
+    // Users table
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
         github_username TEXT PRIMARY KEY,
@@ -48,7 +48,7 @@ async function migrateDb() {
       EXCEPTION WHEN duplicate_column THEN END; $$;
     `);
 
-    // Bots table – store Heroku app name instead of railway_project_id
+    // Bots table
     await client.query(`
       CREATE TABLE IF NOT EXISTS bots (
         app_name TEXT PRIMARY KEY,
@@ -64,7 +64,7 @@ async function migrateDb() {
       EXCEPTION WHEN duplicate_column THEN END; $$;
     `);
 
-    // Plans table (same)
+    // Plans table
     await client.query(`
       CREATE TABLE IF NOT EXISTS plans (
         id SERIAL PRIMARY KEY,
@@ -96,7 +96,7 @@ migrateDb().catch(console.error);
 
 // -------------------- HELPER FUNCTIONS --------------------
 
-// Check GitHub fork (unchanged)
+// Check GitHub fork
 async function checkFork(username) {
   try {
     const url = `https://api.github.com/repos/AbdulRehman19721986/redxbot302/forks?per_page=100`;
@@ -133,9 +133,8 @@ async function herokuRequest(method, path, data = null) {
   }
 }
 
-// Create Heroku app with unique name
+// Create Heroku app
 async function createHerokuApp(baseName) {
-  // Ensure name is valid: lowercase, alphanumeric and hyphens only
   const safeBase = baseName.toLowerCase().replace(/[^a-z0-9-]/g, '');
   const appName = `${safeBase}-${crypto.randomBytes(4).toString('hex')}`;
   const data = await herokuRequest('POST', '/apps', { name: appName, region: 'us' });
@@ -144,15 +143,12 @@ async function createHerokuApp(baseName) {
 
 // Set config vars on Heroku app
 async function setHerokuConfigVars(appName, envVars) {
-  const data = await herokuRequest('PATCH', `/apps/${appName}/config-vars`, envVars);
-  return data;
+  return await herokuRequest('PATCH', `/apps/${appName}/config-vars`, envVars);
 }
 
 // Deploy from GitHub tarball
 async function deployFromGitHub(appName, repoUrl) {
-  // Get tarball URL (main branch)
   const tarballUrl = repoUrl.replace('github.com', 'api.github.com/repos') + '/tarball/main';
-  // Create a build using the tarball
   const build = await herokuRequest('POST', `/apps/${appName}/builds`, {
     source_blob: { url: tarballUrl, version: 'main' }
   });
@@ -272,15 +268,15 @@ app.post('/deploy', async (req, res) => {
     };
     await setHerokuConfigVars(app.name, envVars);
 
-    // 3. Get fork URL for deployment
+    // 3. Get fork URL
     const forkInfo = await checkFork(githubUsername);
     if (!forkInfo.hasFork) {
       throw new Error('User does not have a fork');
     }
-    const repoUrl = forkInfo.forkUrl; // e.g., https://github.com/username/redxbot302
+    const repoUrl = forkInfo.forkUrl;
 
     // 4. Deploy from GitHub fork
-    const build = await deployFromGitHub(app.name, repoUrl);
+    await deployFromGitHub(app.name, repoUrl);
 
     // 5. Save to DB
     await pool.query(
@@ -309,12 +305,10 @@ app.post('/deploy', async (req, res) => {
   }
 });
 
-// Get bot logs – placeholder (Heroku logs require platform API with logplex)
 app.post('/bot-logs', async (req, res) => {
   const { appName } = req.body;
   const bot = await pool.query('SELECT heroku_app_name FROM bots WHERE app_name = $1', [appName]);
   if (bot.rows.length === 0) return res.status(404).json({ error: 'Bot not found' });
-  // Logs can be fetched via Heroku API, but requires additional scopes. Placeholder.
   res.json({ success: true, logs: 'Logs feature not yet implemented. Check Heroku dashboard.' });
 });
 
@@ -324,7 +318,6 @@ app.post('/restart-app', async (req, res) => {
   if (bot.rows.length === 0) return res.status(404).json({ error: 'Bot not found' });
   const herokuAppName = bot.rows[0].heroku_app_name;
   try {
-    // Restart all dynos
     await herokuRequest('DELETE', `/apps/${herokuAppName}/dynos`);
     res.json({ success: true, message: 'Restart initiated' });
   } catch (err) {
