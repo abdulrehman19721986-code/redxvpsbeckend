@@ -11,8 +11,8 @@ app.use(express.json());
 
 // -------------------- CONFIG --------------------
 let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'redx';
-const RAILWAY_TOKEN = process.env.RAILWAY_TOKEN || 'ac073eb8-36dd-4bf6-a4d2-d83445367615';
-const RAILWAY_API = 'https://backboard.railway.app/graphql/v2';
+const HEROKU_API_KEY = process.env.HEROKU_API_KEY;
+const HEROKU_API = 'https://api.heroku.com';
 
 // PostgreSQL connection
 const pool = new Pool({
@@ -24,6 +24,7 @@ const pool = new Pool({
 async function migrateDb() {
   const client = await pool.connect();
   try {
+    // Users table (same as before)
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
         github_username TEXT PRIMARY KEY,
@@ -47,10 +48,11 @@ async function migrateDb() {
       EXCEPTION WHEN duplicate_column THEN END; $$;
     `);
 
+    // Bots table – store Heroku app name instead of railway_project_id
     await client.query(`
       CREATE TABLE IF NOT EXISTS bots (
         app_name TEXT PRIMARY KEY,
-        railway_project_id TEXT,
+        heroku_app_name TEXT,
         github_username TEXT REFERENCES users(github_username) ON DELETE CASCADE,
         created_at TIMESTAMP DEFAULT NOW(),
         status TEXT DEFAULT 'running'
@@ -58,10 +60,11 @@ async function migrateDb() {
     `);
     await client.query(`
       DO $$ BEGIN
-        ALTER TABLE bots ADD COLUMN railway_project_id TEXT;
+        ALTER TABLE bots ADD COLUMN heroku_app_name TEXT;
       EXCEPTION WHEN duplicate_column THEN END; $$;
     `);
 
+    // Plans table (same)
     await client.query(`
       CREATE TABLE IF NOT EXISTS plans (
         id SERIAL PRIMARY KEY,
@@ -93,7 +96,7 @@ migrateDb().catch(console.error);
 
 // -------------------- HELPER FUNCTIONS --------------------
 
-// Check GitHub fork
+// Check GitHub fork (unchanged)
 async function checkFork(username) {
   try {
     const url = `https://api.github.com/repos/AbdulRehman19721986/redxbot302/forks?per_page=100`;
@@ -107,83 +110,70 @@ async function checkFork(username) {
   }
 }
 
-// Railway GraphQL helper with detailed error
-async function railwayGraphQL(query, variables = {}) {
+// Heroku API helper
+async function herokuRequest(method, path, data = null) {
   try {
-    const response = await axios.post(RAILWAY_API, {
-      query,
-      variables
-    }, {
+    const response = await axios({
+      method,
+      url: `${HEROKU_API}${path}`,
       headers: {
-        'Authorization': `Bearer ${RAILWAY_TOKEN}`,
+        'Authorization': `Bearer ${HEROKU_API_KEY}`,
+        'Accept': 'application/vnd.heroku+json; version=3',
         'Content-Type': 'application/json'
-      }
+      },
+      data
     });
-    if (response.data.errors) {
-      const errorMessages = response.data.errors.map(e => e.message).join('; ');
-      throw new Error(`GraphQL errors: ${errorMessages}`);
-    }
-    return response.data.data;
+    return response.data;
   } catch (err) {
     if (err.response) {
-      // The request was made and the server responded with a status code outside 2xx
-      console.error('Railway API response error:', {
-        status: err.response.status,
-        data: err.response.data
-      });
-    } else if (err.request) {
-      console.error('Railway API no response:', err.request);
-    } else {
-      console.error('Railway API error:', err.message);
+      console.error('Heroku API error:', err.response.status, err.response.data);
+      throw new Error(`Heroku API error: ${err.response.data.message || err.response.statusText}`);
     }
     throw err;
   }
 }
 
-// Create Railway project with unique name
-async function createRailwayProject(baseName) {
+// Create Heroku app with unique name
+async function createHerokuApp(baseName) {
   // Ensure name is valid: lowercase, alphanumeric and hyphens only
   const safeBase = baseName.toLowerCase().replace(/[^a-z0-9-]/g, '');
-  const projectName = `${safeBase}-${crypto.randomBytes(4).toString('hex')}`;
-
-  const query = `
-    mutation CreateProject($name: String!) {
-      projectCreate(input: { name: $name }) {
-        project {
-          id
-          name
-        }
-      }
-    }
-  `;
-  const data = await railwayGraphQL(query, { name: projectName });
-  return data.projectCreate.project;
+  const appName = `${safeBase}-${crypto.randomBytes(4).toString('hex')}`;
+  const data = await herokuRequest('POST', '/apps', { name: appName, region: 'us' });
+  return { id: data.id, name: data.name };
 }
 
-// Set environment variables in Railway project
-async function setRailwayVariables(projectId, envVars) {
-  const query = `
-    mutation VariableCollectionUpsert($projectId: String!, $variables: [VariableInput!]!) {
-      variableCollectionUpsert(input: { projectId: $projectId, variables: $variables }) {
-        variables {
-          name
-          value
-        }
-      }
-    }
-  `;
-  const variables = Object.entries(envVars).map(([key, value]) => ({
-    name: key,
-    value: String(value)
-  }));
-  const data = await railwayGraphQL(query, { projectId, variables });
-  return data.variableCollectionUpsert;
+// Set config vars on Heroku app
+async function setHerokuConfigVars(appName, envVars) {
+  const data = await herokuRequest('PATCH', `/apps/${appName}/config-vars`, envVars);
+  return data;
+}
+
+// Deploy from GitHub tarball
+async function deployFromGitHub(appName, repoUrl) {
+  // Get tarball URL (main branch)
+  const tarballUrl = repoUrl.replace('github.com', 'api.github.com/repos') + '/tarball/main';
+  // Create a build using the tarball
+  const build = await herokuRequest('POST', `/apps/${appName}/builds`, {
+    source_blob: { url: tarballUrl, version: 'main' }
+  });
+  return build;
+}
+
+// Delete Heroku app
+async function deleteHerokuApp(appName) {
+  try {
+    await herokuRequest('DELETE', `/apps/${appName}`);
+    return true;
+  } catch (err) {
+    console.error(`Failed to delete Heroku app ${appName}:`, err.message);
+    return false;
+  }
 }
 
 // -------------------- ROOT ROUTE --------------------
 app.get('/', (req, res) => {
-  res.json({ 
-    message: 'REDX Bot Deployer Backend (Railway)',
+  res.json({
+    message: 'REDX Bot Deployer Backend (Heroku)',
     status: 'running',
     endpoints: ['/api/health', '/api/plans', '/check-fork', '/deploy', '/admin/login', '/admin/update-password']
   });
@@ -211,18 +201,18 @@ app.post('/check-fork', async (req, res) => {
       'INSERT INTO users (github_username, max_bots, subscription_plan) VALUES ($1, $2, $3)',
       [githubUsername.toLowerCase(), 2, 'free']
     );
-    userData = { 
-      github_username: githubUsername.toLowerCase(), 
-      is_approved: true, 
+    userData = {
+      github_username: githubUsername.toLowerCase(),
+      is_approved: true,
       is_banned: false,
-      max_bots: 2, 
+      max_bots: 2,
       deployment_count: 0,
-      subscription_plan: 'free' 
+      subscription_plan: 'free'
     };
   }
 
   const bots = await pool.query(
-    'SELECT app_name, railway_project_id, created_at, status FROM bots WHERE github_username = $1',
+    'SELECT app_name, heroku_app_name, created_at, status FROM bots WHERE github_username = $1',
     [githubUsername.toLowerCase()]
   );
 
@@ -259,8 +249,8 @@ app.post('/deploy', async (req, res) => {
   const baseName = customAppName || `redx-${githubUsername}`;
 
   try {
-    // 1. Create Railway project with unique name
-    const project = await createRailwayProject(baseName);
+    // 1. Create Heroku app
+    const app = await createHerokuApp(baseName);
 
     // 2. Set environment variables
     const envVars = {
@@ -280,58 +270,80 @@ app.post('/deploy', async (req, res) => {
       AUTO_TYPING: config.AUTO_TYPING || 'false',
       GITHUB_USERNAME: githubUsername
     };
-    await setRailwayVariables(project.id, envVars);
+    await setHerokuConfigVars(app.name, envVars);
 
-    // 3. Save to DB
+    // 3. Get fork URL for deployment
+    const forkInfo = await checkFork(githubUsername);
+    if (!forkInfo.hasFork) {
+      throw new Error('User does not have a fork');
+    }
+    const repoUrl = forkInfo.forkUrl; // e.g., https://github.com/username/redxbot302
+
+    // 4. Deploy from GitHub fork
+    const build = await deployFromGitHub(app.name, repoUrl);
+
+    // 5. Save to DB
     await pool.query(
-      'INSERT INTO bots (app_name, railway_project_id, github_username, status) VALUES ($1, $2, $3, $4)',
-      [baseName, project.id, githubUsername.toLowerCase(), 'running']
+      'INSERT INTO bots (app_name, heroku_app_name, github_username, status) VALUES ($1, $2, $3, $4)',
+      [baseName, app.name, githubUsername.toLowerCase(), 'deploying']
     );
     await pool.query(
       'UPDATE users SET deployment_count = deployment_count + 1 WHERE github_username = $1',
       [githubUsername.toLowerCase()]
     );
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       appName: baseName,
-      railwayProjectId: project.id,
-      message: 'Bot deployed to Railway successfully! It may take a few minutes to start.'
+      herokuAppName: app.name,
+      message: `Bot deployed to Heroku successfully! It may take a few minutes to start. Access at https://${app.name}.herokuapp.com`
     });
 
   } catch (error) {
     console.error('Deployment error:', error);
-    // Send detailed error to frontend
-    res.status(500).json({ 
-      error: 'Failed to deploy to Railway', 
+    res.status(500).json({
+      error: 'Failed to deploy to Heroku',
       details: error.message,
       stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
     });
   }
 });
 
-// Get bot logs – placeholder
+// Get bot logs – placeholder (Heroku logs require platform API with logplex)
 app.post('/bot-logs', async (req, res) => {
   const { appName } = req.body;
-  res.json({ success: true, logs: 'Logs feature not yet implemented. Check Railway dashboard.' });
+  const bot = await pool.query('SELECT heroku_app_name FROM bots WHERE app_name = $1', [appName]);
+  if (bot.rows.length === 0) return res.status(404).json({ error: 'Bot not found' });
+  // Logs can be fetched via Heroku API, but requires additional scopes. Placeholder.
+  res.json({ success: true, logs: 'Logs feature not yet implemented. Check Heroku dashboard.' });
 });
 
 app.post('/restart-app', async (req, res) => {
   const { appName } = req.body;
-  const bot = await pool.query('SELECT railway_project_id FROM bots WHERE app_name = $1', [appName]);
+  const bot = await pool.query('SELECT heroku_app_name FROM bots WHERE app_name = $1', [appName]);
   if (bot.rows.length === 0) return res.status(404).json({ error: 'Bot not found' });
-  // Call Railway API to restart (deploy again)
-  res.json({ success: false, error: 'Restart not implemented yet.' });
+  const herokuAppName = bot.rows[0].heroku_app_name;
+  try {
+    // Restart all dynos
+    await herokuRequest('DELETE', `/apps/${herokuAppName}/dynos`);
+    res.json({ success: true, message: 'Restart initiated' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 app.post('/delete-app', async (req, res) => {
   const { appName, githubUsername } = req.body;
-  const bot = await pool.query('SELECT railway_project_id FROM bots WHERE app_name = $1', [appName]);
+  const bot = await pool.query('SELECT heroku_app_name FROM bots WHERE app_name = $1', [appName]);
   if (bot.rows.length === 0) return res.status(404).json({ error: 'Bot not found' });
-  const projectId = bot.rows[0].railway_project_id;
-  // Call Railway API to delete project (if available)
-  await pool.query('DELETE FROM bots WHERE app_name = $1', [appName]);
-  res.json({ success: true, message: 'Bot deleted (Railway cleanup not implemented).' });
+  const herokuAppName = bot.rows[0].heroku_app_name;
+  try {
+    await deleteHerokuApp(herokuAppName);
+    await pool.query('DELETE FROM bots WHERE app_name = $1', [appName]);
+    res.json({ success: true, message: 'Bot deleted from Heroku' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 app.post('/api/buy-plan', (req, res) => {
@@ -389,10 +401,10 @@ app.post('/admin/delete-user', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { githubUsername } = req.body;
 
-  const bots = await pool.query('SELECT railway_project_id FROM bots WHERE github_username = $1', [githubUsername.toLowerCase()]);
+  const bots = await pool.query('SELECT heroku_app_name FROM bots WHERE github_username = $1', [githubUsername.toLowerCase()]);
   for (const bot of bots.rows) {
-    if (bot.railway_project_id) {
-      // Call Railway API to delete project
+    if (bot.heroku_app_name) {
+      await deleteHerokuApp(bot.heroku_app_name).catch(console.error);
     }
   }
   await pool.query('DELETE FROM users WHERE github_username = $1', [githubUsername.toLowerCase()]);
@@ -443,9 +455,9 @@ app.post('/delete-multiple-apps', async (req, res) => {
   const results = { success: [], failed: [] };
   for (const { name } of apps) {
     try {
-      const bot = await pool.query('SELECT railway_project_id FROM bots WHERE app_name = $1', [name]);
+      const bot = await pool.query('SELECT heroku_app_name FROM bots WHERE app_name = $1', [name]);
       if (bot.rows.length) {
-        // Call Railway API to delete project
+        await deleteHerokuApp(bot.rows[0].heroku_app_name);
       }
       await pool.query('DELETE FROM bots WHERE app_name = $1', [name]);
       results.success.push(name);
