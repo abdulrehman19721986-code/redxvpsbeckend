@@ -14,10 +14,9 @@ const HEROKU_API_KEY = process.env.HEROKU_API_KEY;
 const HEROKU_API = 'https://api.heroku.com';
 
 // -------------------- IN-MEMORY STORAGE --------------------
-// Data structures
 let users = {};          // key: github_username (lowercase)
 let bots = {};           // key: app_name
-let plans = {};          // key: plan_id (e.g., 'free', 'pro', 'premium')
+let plans = {};          // key: plan_id
 let announcements = {};  // key: announcement_id
 
 // Initialize default plans
@@ -56,22 +55,19 @@ function initPlans() {
 }
 initPlans();
 
-// Initialize a default user for testing (optional)
-function initTestUser() {
-  if (!users['abdulrehman19721986']) {
-    users['abdulrehman19721986'] = {
-      github_username: 'abdulrehman19721986',
-      is_approved: true,
-      is_banned: false,
-      max_bots: 2,
-      deployment_count: 0,
-      subscription_plan: 'free',
-      expiry_date: null,
-      created_at: Date.now()
-    };
-  }
+// Optional: add a test user
+if (!users['abdulrehman19721986']) {
+  users['abdulrehman19721986'] = {
+    github_username: 'abdulrehman19721986',
+    is_approved: true,
+    is_banned: false,
+    max_bots: 2,
+    deployment_count: 0,
+    subscription_plan: 'free',
+    expiry_date: null,
+    created_at: Date.now()
+  };
 }
-initTestUser();
 
 // -------------------- HELPER FUNCTIONS --------------------
 
