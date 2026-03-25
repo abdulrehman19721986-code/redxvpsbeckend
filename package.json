@@ -1,6 +1,7 @@
 {
-  "name": "redx-backend",
+  "name": "redx-bot-deployer",
   "version": "1.0.0",
+  "description": "Backend for deploying REDX WhatsApp bots to Heroku",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
