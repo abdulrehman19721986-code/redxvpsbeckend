@@ -3,6 +3,8 @@ const { Pool } = require('pg');
 const cors = require('cors');
 const axios = require('axios');
 const crypto = require('crypto');
+const dns = require('dns').promises;
+const url = require('url');
 require('dotenv').config();
 
 const app = express();
@@ -14,15 +16,54 @@ let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'redx';
 const HEROKU_API_KEY = process.env.HEROKU_API_KEY;
 const HEROKU_API = 'https://api.heroku.com';
 
-// PostgreSQL connection with IPv4 fix
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  family: 4  // Force IPv4 to avoid ENETUNREACH errors
-});
+// Function to parse DATABASE_URL and get a pool config with IPv4
+async function getPoolConfig() {
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    throw new Error('DATABASE_URL is not set');
+  }
+
+  // Parse the URL
+  const parsed = new url.URL(connectionString);
+  const hostname = parsed.hostname;
+  const port = parsed.port || 5432;
+  const user = parsed.username;
+  const password = decodeURIComponent(parsed.password);
+  const database = parsed.pathname.slice(1);
+
+  // Resolve hostname to IPv4 address
+  let ipv4 = null;
+  try {
+    const addresses = await dns.resolve4(hostname);
+    if (addresses && addresses.length > 0) {
+      ipv4 = addresses[0];
+      console.log(`Resolved ${hostname} to IPv4: ${ipv4}`);
+    } else {
+      throw new Error('No IPv4 address found');
+    }
+  } catch (err) {
+    console.error('DNS resolution error:', err.message);
+    // Fallback to original hostname
+    ipv4 = hostname;
+  }
+
+  // Build connection config
+  return {
+    host: ipv4,
+    port: parseInt(port, 10),
+    user: user,
+    password: password,
+    database: database,
+    ssl: { rejectUnauthorized: false },
+  };
+}
+
+// PostgreSQL connection pool (will be set after DNS resolution)
+let pool = null;
 
 // -------------------- DATABASE MIGRATION --------------------
 async function migrateDb() {
+  if (!pool) return;
   const client = await pool.connect();
   try {
     // Users table
@@ -111,7 +152,6 @@ async function migrateDb() {
     client.release();
   }
 }
-migrateDb().catch(console.error);
 
 // -------------------- HELPER FUNCTIONS --------------------
 
@@ -343,9 +383,7 @@ app.post('/update-config', async (req, res) => {
   const herokuAppName = bot.rows[0].heroku_app_name;
 
   try {
-    // Update config vars on Heroku
     await setHerokuConfigVars(herokuAppName, config);
-    // Save to local DB
     await pool.query('UPDATE bots SET config = $1 WHERE app_name = $2', [JSON.stringify(config), appName]);
     res.json({ success: true, message: 'Config updated' });
   } catch (err) {
@@ -548,5 +586,24 @@ app.post('/delete-multiple-apps', async (req, res) => {
   res.json({ success: true, results });
 });
 
+// -------------------- START SERVER --------------------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
+
+// Initialize database connection before starting the server
+(async () => {
+  try {
+    const config = await getPoolConfig();
+    pool = new Pool(config);
+    console.log('Database pool created with IPv4 configuration');
+
+    // Run migration
+    await migrateDb();
+    console.log('Database migration completed');
+
+    // Start server
+    app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
+  } catch (err) {
+    console.error('Failed to initialize database:', err);
+    process.exit(1);
+  }
+})();
