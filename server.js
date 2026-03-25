@@ -14,10 +14,11 @@ let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'redx';
 const HEROKU_API_KEY = process.env.HEROKU_API_KEY;
 const HEROKU_API = 'https://api.heroku.com';
 
-// PostgreSQL connection
+// PostgreSQL connection with IPv4 fix
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  family: 4  // Force IPv4 to avoid ENETUNREACH errors
 });
 
 // -------------------- DATABASE MIGRATION --------------------
@@ -55,12 +56,18 @@ async function migrateDb() {
         heroku_app_name TEXT,
         github_username TEXT REFERENCES users(github_username) ON DELETE CASCADE,
         created_at TIMESTAMP DEFAULT NOW(),
-        status TEXT DEFAULT 'running'
+        status TEXT DEFAULT 'running',
+        config JSONB
       );
     `);
     await client.query(`
       DO $$ BEGIN
         ALTER TABLE bots ADD COLUMN heroku_app_name TEXT;
+      EXCEPTION WHEN duplicate_column THEN END; $$;
+    `);
+    await client.query(`
+      DO $$ BEGIN
+        ALTER TABLE bots ADD COLUMN config JSONB;
       EXCEPTION WHEN duplicate_column THEN END; $$;
     `);
 
@@ -74,6 +81,18 @@ async function migrateDb() {
         max_bots INTEGER,
         features TEXT[],
         is_active BOOLEAN DEFAULT true
+      );
+    `);
+
+    // Announcements table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS announcements (
+        id SERIAL PRIMARY KEY,
+        title TEXT NOT NULL,
+        content TEXT NOT NULL,
+        priority INTEGER DEFAULT 1,
+        active BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT NOW()
       );
     `);
 
@@ -171,7 +190,11 @@ app.get('/', (req, res) => {
   res.json({
     message: 'REDX Bot Deployer Backend (Heroku)',
     status: 'running',
-    endpoints: ['/api/health', '/api/plans', '/check-fork', '/deploy', '/admin/login', '/admin/update-password']
+    endpoints: [
+      '/api/health', '/api/plans', '/check-fork', '/deploy',
+      '/admin/login', '/admin/update-password', '/announcements/list',
+      '/admin/announcements', '/get-config', '/update-config'
+    ]
   });
 });
 
@@ -280,8 +303,8 @@ app.post('/deploy', async (req, res) => {
 
     // 5. Save to DB
     await pool.query(
-      'INSERT INTO bots (app_name, heroku_app_name, github_username, status) VALUES ($1, $2, $3, $4)',
-      [baseName, app.name, githubUsername.toLowerCase(), 'deploying']
+      'INSERT INTO bots (app_name, heroku_app_name, github_username, status, config) VALUES ($1, $2, $3, $4, $5)',
+      [baseName, app.name, githubUsername.toLowerCase(), 'deploying', JSON.stringify(envVars)]
     );
     await pool.query(
       'UPDATE users SET deployment_count = deployment_count + 1 WHERE github_username = $1',
@@ -305,6 +328,32 @@ app.post('/deploy', async (req, res) => {
   }
 });
 
+// Bot configuration endpoints
+app.post('/get-config', async (req, res) => {
+  const { appName } = req.body;
+  const bot = await pool.query('SELECT config FROM bots WHERE app_name = $1', [appName]);
+  if (bot.rows.length === 0) return res.status(404).json({ error: 'Bot not found' });
+  res.json({ success: true, config: bot.rows[0].config || {} });
+});
+
+app.post('/update-config', async (req, res) => {
+  const { appName, config } = req.body;
+  const bot = await pool.query('SELECT heroku_app_name FROM bots WHERE app_name = $1', [appName]);
+  if (bot.rows.length === 0) return res.status(404).json({ error: 'Bot not found' });
+  const herokuAppName = bot.rows[0].heroku_app_name;
+
+  try {
+    // Update config vars on Heroku
+    await setHerokuConfigVars(herokuAppName, config);
+    // Save to local DB
+    await pool.query('UPDATE bots SET config = $1 WHERE app_name = $2', [JSON.stringify(config), appName]);
+    res.json({ success: true, message: 'Config updated' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Logs (placeholder)
 app.post('/bot-logs', async (req, res) => {
   const { appName } = req.body;
   const bot = await pool.query('SELECT heroku_app_name FROM bots WHERE app_name = $1', [appName]);
@@ -344,6 +393,12 @@ app.post('/api/buy-plan', (req, res) => {
   const message = `I want to buy the ${planName} plan (${price}). My GitHub: ${githubUsername}`;
   const whatsappLink = `https://wa.me/923009842133?text=${encodeURIComponent(message)}`;
   res.json({ whatsappLink });
+});
+
+// Announcements - Public
+app.post('/announcements/list', async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM announcements WHERE active = true ORDER BY priority ASC, created_at DESC');
+  res.json({ announcements: rows });
 });
 
 // -------------------- ADMIN ROUTES --------------------
@@ -433,6 +488,38 @@ app.post('/admin/update-plan', async (req, res) => {
 app.post('/admin/delete-plan', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   await pool.query('DELETE FROM plans WHERE id = $1', [req.body.id]);
+  res.json({ success: true });
+});
+
+app.post('/admin/announcements', async (req, res) => {
+  if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
+  const { rows } = await pool.query('SELECT * FROM announcements ORDER BY priority ASC, created_at DESC');
+  res.json({ announcements: rows });
+});
+
+app.post('/admin/create-announcement', async (req, res) => {
+  if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
+  const { title, content, priority, active } = req.body;
+  await pool.query(
+    'INSERT INTO announcements (title, content, priority, active) VALUES ($1, $2, $3, $4)',
+    [title, content, priority || 1, active !== undefined ? active : true]
+  );
+  res.json({ success: true });
+});
+
+app.post('/admin/update-announcement', async (req, res) => {
+  if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
+  const { id, title, content, priority, active } = req.body;
+  await pool.query(
+    'UPDATE announcements SET title=$1, content=$2, priority=$3, active=$4 WHERE id=$5',
+    [title, content, priority, active, id]
+  );
+  res.json({ success: true });
+});
+
+app.post('/admin/delete-announcement', async (req, res) => {
+  if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
+  await pool.query('DELETE FROM announcements WHERE id = $1', [req.body.id]);
   res.json({ success: true });
 });
 
