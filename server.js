@@ -1,5 +1,4 @@
 const express = require('express');
-const { Pool } = require('pg');
 const cors = require('cors');
 const axios = require('axios');
 const crypto = require('crypto');
@@ -14,104 +13,65 @@ let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'redx';
 const HEROKU_API_KEY = process.env.HEROKU_API_KEY;
 const HEROKU_API = 'https://api.heroku.com';
 
-// PostgreSQL connection – force IPv4
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  family: 4   // ✅ Force IPv4 to avoid ENETUNREACH
-});
+// -------------------- IN-MEMORY STORAGE --------------------
+// Data structures
+let users = {};          // key: github_username (lowercase)
+let bots = {};           // key: app_name
+let plans = {};          // key: plan_id (e.g., 'free', 'pro', 'premium')
+let announcements = {};  // key: announcement_id
 
-// -------------------- DATABASE MIGRATION --------------------
-async function migrateDb() {
-  const client = await pool.connect();
-  try {
-    // Users table
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        github_username TEXT PRIMARY KEY,
-        is_approved BOOLEAN DEFAULT true,
-        is_banned BOOLEAN DEFAULT false,
-        max_bots INTEGER DEFAULT 2,
-        deployment_count INTEGER DEFAULT 0,
-        expiry_date TIMESTAMP,
-        subscription_plan TEXT DEFAULT 'free',
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-    `);
-    await client.query(`
-      DO $$ BEGIN
-        ALTER TABLE users ADD COLUMN is_banned BOOLEAN DEFAULT false;
-      EXCEPTION WHEN duplicate_column THEN END; $$;
-    `);
-    await client.query(`
-      DO $$ BEGIN
-        ALTER TABLE users ADD COLUMN deployment_count INTEGER DEFAULT 0;
-      EXCEPTION WHEN duplicate_column THEN END; $$;
-    `);
-
-    // Bots table
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS bots (
-        app_name TEXT PRIMARY KEY,
-        heroku_app_name TEXT,
-        github_username TEXT REFERENCES users(github_username) ON DELETE CASCADE,
-        created_at TIMESTAMP DEFAULT NOW(),
-        status TEXT DEFAULT 'running',
-        config JSONB
-      );
-    `);
-    await client.query(`
-      DO $$ BEGIN
-        ALTER TABLE bots ADD COLUMN heroku_app_name TEXT;
-      EXCEPTION WHEN duplicate_column THEN END; $$;
-    `);
-    await client.query(`
-      DO $$ BEGIN
-        ALTER TABLE bots ADD COLUMN config JSONB;
-      EXCEPTION WHEN duplicate_column THEN END; $$;
-    `);
-
-    // Plans table
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS plans (
-        id SERIAL PRIMARY KEY,
-        name TEXT UNIQUE,
-        price TEXT,
-        duration_days INTEGER,
-        max_bots INTEGER,
-        features TEXT[],
-        is_active BOOLEAN DEFAULT true
-      );
-    `);
-
-    // Announcements table
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS announcements (
-        id SERIAL PRIMARY KEY,
-        title TEXT NOT NULL,
-        content TEXT NOT NULL,
-        priority INTEGER DEFAULT 1,
-        active BOOLEAN DEFAULT true,
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-    `);
-
-    const { rows } = await client.query('SELECT COUNT(*) FROM plans');
-    if (parseInt(rows[0].count) === 0) {
-      await client.query(
-        `INSERT INTO plans (name, price, duration_days, max_bots, features) VALUES 
-         ('free', 'Free', 36500, 2, ARRAY['2 bots', 'Basic features', 'Community support']),
-         ('pro', '$5/month', 30, 5, ARRAY['5 bots', 'Advanced features', 'Priority support']),
-         ('premium', '$10/month', 30, 10, ARRAY['10 bots', 'All features', 'VIP support', 'Early access'])`
-      );
-    }
-  } catch (err) {
-    console.error('Migration error:', err);
-  } finally {
-    client.release();
+// Initialize default plans
+function initPlans() {
+  if (Object.keys(plans).length === 0) {
+    plans = {
+      free: {
+        id: 'free',
+        name: 'free',
+        price: 'Free',
+        duration_days: 36500,
+        max_bots: 2,
+        features: ['2 bots', 'Basic features', 'Community support'],
+        is_active: true
+      },
+      pro: {
+        id: 'pro',
+        name: 'pro',
+        price: '$5/month',
+        duration_days: 30,
+        max_bots: 5,
+        features: ['5 bots', 'Advanced features', 'Priority support'],
+        is_active: true
+      },
+      premium: {
+        id: 'premium',
+        name: 'premium',
+        price: '$10/month',
+        duration_days: 30,
+        max_bots: 10,
+        features: ['10 bots', 'All features', 'VIP support', 'Early access'],
+        is_active: true
+      }
+    };
   }
 }
-migrateDb().catch(console.error);
+initPlans();
+
+// Initialize a default user for testing (optional)
+function initTestUser() {
+  if (!users['abdulrehman19721986']) {
+    users['abdulrehman19721986'] = {
+      github_username: 'abdulrehman19721986',
+      is_approved: true,
+      is_banned: false,
+      max_bots: 2,
+      deployment_count: 0,
+      subscription_plan: 'free',
+      expiry_date: null,
+      created_at: Date.now()
+    };
+  }
+}
+initTestUser();
 
 // -------------------- HELPER FUNCTIONS --------------------
 
@@ -188,7 +148,7 @@ async function deleteHerokuApp(appName) {
 // -------------------- ROOT ROUTE --------------------
 app.get('/', (req, res) => {
   res.json({
-    message: 'REDX Bot Deployer Backend (Heroku)',
+    message: 'REDX Bot Deployer Backend (Heroku + In-Memory)',
     status: 'running',
     endpoints: [
       '/api/health', '/api/plans', '/check-fork', '/deploy',
@@ -202,9 +162,9 @@ app.get('/', (req, res) => {
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
-app.get('/api/plans', async (req, res) => {
-  const { rows } = await pool.query('SELECT * FROM plans WHERE is_active = true');
-  res.json({ plans: rows });
+app.get('/api/plans', (req, res) => {
+  const activePlans = Object.values(plans).filter(p => p.is_active);
+  res.json({ plans: activePlans });
 });
 
 app.post('/check-fork', async (req, res) => {
@@ -212,29 +172,23 @@ app.post('/check-fork', async (req, res) => {
   if (!githubUsername) return res.status(400).json({ error: 'Username required' });
 
   const forkInfo = await checkFork(githubUsername);
-  const user = await pool.query('SELECT * FROM users WHERE github_username = $1', [githubUsername.toLowerCase()]);
-  let userData = user.rows[0];
+  const userKey = githubUsername.toLowerCase();
+  let userData = users[userKey];
 
   if (!userData) {
-    await pool.query(
-      'INSERT INTO users (github_username, max_bots, subscription_plan) VALUES ($1, $2, $3)',
-      [githubUsername.toLowerCase(), 2, 'free']
-    );
     userData = {
-      github_username: githubUsername.toLowerCase(),
+      github_username: userKey,
       is_approved: true,
       is_banned: false,
       max_bots: 2,
       deployment_count: 0,
-      subscription_plan: 'free'
+      subscription_plan: 'free',
+      created_at: Date.now()
     };
+    users[userKey] = userData;
   }
 
-  const bots = await pool.query(
-    'SELECT app_name, heroku_app_name, created_at, status FROM bots WHERE github_username = $1',
-    [githubUsername.toLowerCase()]
-  );
-
+  const userBots = Object.values(bots).filter(b => b.github_username === userKey);
   res.json({
     hasFork: forkInfo.hasFork,
     forkUrl: forkInfo.forkUrl,
@@ -244,8 +198,13 @@ app.post('/check-fork', async (req, res) => {
     deploymentCount: userData.deployment_count,
     expiryDate: userData.expiry_date,
     subscriptionPlan: userData.subscription_plan,
-    deployedBots: bots.rows,
-    currentBots: bots.rows.length
+    deployedBots: userBots.map(b => ({
+      app_name: b.app_name,
+      heroku_app_name: b.heroku_app_name,
+      created_at: b.created_at,
+      status: b.status
+    })),
+    currentBots: userBots.length
   });
 });
 
@@ -253,15 +212,14 @@ app.post('/deploy', async (req, res) => {
   const { githubUsername, sessionId, appName: customAppName, ...config } = req.body;
   if (!githubUsername || !sessionId) return res.status(400).json({ error: 'Missing fields' });
 
-  const user = await pool.query('SELECT * FROM users WHERE github_username = $1', [githubUsername.toLowerCase()]);
-  if (user.rows.length === 0) return res.status(403).json({ error: 'User not found' });
-  const userData = user.rows[0];
-
+  const userKey = githubUsername.toLowerCase();
+  const userData = users[userKey];
+  if (!userData) return res.status(403).json({ error: 'User not found' });
   if (userData.is_banned) return res.status(403).json({ error: 'User is banned' });
   if (!userData.is_approved) return res.status(403).json({ error: 'User not approved' });
 
-  const botCount = await pool.query('SELECT COUNT(*) FROM bots WHERE github_username = $1', [githubUsername.toLowerCase()]);
-  if (parseInt(botCount.rows[0].count) >= userData.max_bots) {
+  const currentBotCount = Object.values(bots).filter(b => b.github_username === userKey).length;
+  if (currentBotCount >= userData.max_bots) {
     return res.status(403).json({ error: `Bot limit reached (max ${userData.max_bots} bots)` });
   }
 
@@ -301,19 +259,23 @@ app.post('/deploy', async (req, res) => {
     // 4. Deploy from GitHub fork
     await deployFromGitHub(app.name, repoUrl);
 
-    // 5. Save to DB
-    await pool.query(
-      'INSERT INTO bots (app_name, heroku_app_name, github_username, status, config) VALUES ($1, $2, $3, $4, $5)',
-      [baseName, app.name, githubUsername.toLowerCase(), 'deploying', JSON.stringify(envVars)]
-    );
-    await pool.query(
-      'UPDATE users SET deployment_count = deployment_count + 1 WHERE github_username = $1',
-      [githubUsername.toLowerCase()]
-    );
+    // 5. Save bot in memory
+    const botId = baseName;
+    bots[botId] = {
+      app_name: botId,
+      heroku_app_name: app.name,
+      github_username: userKey,
+      created_at: Date.now(),
+      status: 'deploying',
+      config: envVars
+    };
+
+    // Update user deployment count
+    userData.deployment_count = (userData.deployment_count || 0) + 1;
 
     res.json({
       success: true,
-      appName: baseName,
+      appName: botId,
       herokuAppName: app.name,
       message: `Bot deployed to Heroku successfully! It may take a few minutes to start. Access at https://${app.name}.herokuapp.com`
     });
@@ -329,40 +291,40 @@ app.post('/deploy', async (req, res) => {
 });
 
 // Bot configuration endpoints
-app.post('/get-config', async (req, res) => {
+app.post('/get-config', (req, res) => {
   const { appName } = req.body;
-  const bot = await pool.query('SELECT config FROM bots WHERE app_name = $1', [appName]);
-  if (bot.rows.length === 0) return res.status(404).json({ error: 'Bot not found' });
-  res.json({ success: true, config: bot.rows[0].config || {} });
+  const bot = bots[appName];
+  if (!bot) return res.status(404).json({ error: 'Bot not found' });
+  res.json({ success: true, config: bot.config || {} });
 });
 
 app.post('/update-config', async (req, res) => {
   const { appName, config } = req.body;
-  const bot = await pool.query('SELECT heroku_app_name FROM bots WHERE app_name = $1', [appName]);
-  if (bot.rows.length === 0) return res.status(404).json({ error: 'Bot not found' });
-  const herokuAppName = bot.rows[0].heroku_app_name;
+  const bot = bots[appName];
+  if (!bot) return res.status(404).json({ error: 'Bot not found' });
+  const herokuAppName = bot.heroku_app_name;
 
   try {
     await setHerokuConfigVars(herokuAppName, config);
-    await pool.query('UPDATE bots SET config = $1 WHERE app_name = $2', [JSON.stringify(config), appName]);
+    bot.config = config;
     res.json({ success: true, message: 'Config updated' });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-app.post('/bot-logs', async (req, res) => {
+app.post('/bot-logs', (req, res) => {
   const { appName } = req.body;
-  const bot = await pool.query('SELECT heroku_app_name FROM bots WHERE app_name = $1', [appName]);
-  if (bot.rows.length === 0) return res.status(404).json({ error: 'Bot not found' });
+  const bot = bots[appName];
+  if (!bot) return res.status(404).json({ error: 'Bot not found' });
   res.json({ success: true, logs: 'Logs feature not yet implemented. Check Heroku dashboard.' });
 });
 
 app.post('/restart-app', async (req, res) => {
   const { appName } = req.body;
-  const bot = await pool.query('SELECT heroku_app_name FROM bots WHERE app_name = $1', [appName]);
-  if (bot.rows.length === 0) return res.status(404).json({ error: 'Bot not found' });
-  const herokuAppName = bot.rows[0].heroku_app_name;
+  const bot = bots[appName];
+  if (!bot) return res.status(404).json({ error: 'Bot not found' });
+  const herokuAppName = bot.heroku_app_name;
   try {
     await herokuRequest('DELETE', `/apps/${herokuAppName}/dynos`);
     res.json({ success: true, message: 'Restart initiated' });
@@ -373,12 +335,12 @@ app.post('/restart-app', async (req, res) => {
 
 app.post('/delete-app', async (req, res) => {
   const { appName, githubUsername } = req.body;
-  const bot = await pool.query('SELECT heroku_app_name FROM bots WHERE app_name = $1', [appName]);
-  if (bot.rows.length === 0) return res.status(404).json({ error: 'Bot not found' });
-  const herokuAppName = bot.rows[0].heroku_app_name;
+  const bot = bots[appName];
+  if (!bot) return res.status(404).json({ error: 'Bot not found' });
+  const herokuAppName = bot.heroku_app_name;
   try {
     await deleteHerokuApp(herokuAppName);
-    await pool.query('DELETE FROM bots WHERE app_name = $1', [appName]);
+    delete bots[appName];
     res.json({ success: true, message: 'Bot deleted from Heroku' });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -393,9 +355,10 @@ app.post('/api/buy-plan', (req, res) => {
 });
 
 // Announcements - Public
-app.post('/announcements/list', async (req, res) => {
-  const { rows } = await pool.query('SELECT * FROM announcements WHERE active = true ORDER BY priority ASC, created_at DESC');
-  res.json({ announcements: rows });
+app.post('/announcements/list', (req, res) => {
+  const active = Object.values(announcements).filter(a => a.active);
+  active.sort((a, b) => (a.priority || 1) - (b.priority || 1));
+  res.json({ announcements: active });
 });
 
 // -------------------- ADMIN ROUTES --------------------
@@ -415,115 +378,123 @@ app.post('/admin/update-password', (req, res) => {
   res.json({ success: true, message: 'Password updated (memory only).' });
 });
 
-app.post('/admin/users', async (req, res) => {
+app.post('/admin/users', (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  const { rows } = await pool.query(`
-    SELECT u.*, COUNT(b.app_name) as active_bots 
-    FROM users u 
-    LEFT JOIN bots b ON u.github_username = b.github_username 
-    GROUP BY u.github_username
-  `);
-  res.json({ users: rows });
+  const usersList = Object.values(users).map(u => {
+    const activeBots = Object.values(bots).filter(b => b.github_username === u.github_username).length;
+    return { ...u, active_bots: activeBots };
+  });
+  res.json({ users: usersList });
 });
 
-app.post('/admin/update-user', async (req, res) => {
+app.post('/admin/update-user', (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { githubUsername, isApproved, isBanned, maxBots, expiryDate, subscriptionPlan } = req.body;
-  await pool.query(
-    `UPDATE users SET 
-      is_approved = COALESCE($2, is_approved),
-      is_banned = COALESCE($3, is_banned),
-      max_bots = COALESCE($4, max_bots),
-      expiry_date = COALESCE($5, expiry_date),
-      subscription_plan = COALESCE($6, subscription_plan)
-     WHERE github_username = $1`,
-    [githubUsername.toLowerCase(), isApproved, isBanned, maxBots, expiryDate, subscriptionPlan]
-  );
+  const userKey = githubUsername.toLowerCase();
+  const user = users[userKey];
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  if (isApproved !== undefined) user.is_approved = isApproved;
+  if (isBanned !== undefined) user.is_banned = isBanned;
+  if (maxBots !== undefined) user.max_bots = maxBots;
+  if (expiryDate !== undefined) user.expiry_date = expiryDate;
+  if (subscriptionPlan !== undefined) user.subscription_plan = subscriptionPlan;
   res.json({ success: true });
 });
 
 app.post('/admin/delete-user', async (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { githubUsername } = req.body;
-
-  const bots = await pool.query('SELECT heroku_app_name FROM bots WHERE github_username = $1', [githubUsername.toLowerCase()]);
-  for (const bot of bots.rows) {
+  const userKey = githubUsername.toLowerCase();
+  const userBots = Object.values(bots).filter(b => b.github_username === userKey);
+  for (const bot of userBots) {
     if (bot.heroku_app_name) {
       await deleteHerokuApp(bot.heroku_app_name).catch(console.error);
     }
+    delete bots[bot.app_name];
   }
-  await pool.query('DELETE FROM users WHERE github_username = $1', [githubUsername.toLowerCase()]);
+  delete users[userKey];
   res.json({ success: true });
 });
 
-app.post('/admin/plans', async (req, res) => {
+app.post('/admin/plans', (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  const { rows } = await pool.query('SELECT * FROM plans');
-  res.json({ plans: rows });
+  const plansArray = Object.values(plans).map(p => ({ ...p, id: p.id }));
+  res.json({ plans: plansArray });
 });
 
-app.post('/admin/create-plan', async (req, res) => {
+app.post('/admin/create-plan', (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  const { name, price, duration_days, max_bots, features } = req.body;
-  await pool.query(
-    'INSERT INTO plans (name, price, duration_days, max_bots, features) VALUES ($1, $2, $3, $4, $5)',
-    [name, price, duration_days, max_bots, features]
-  );
+  const { name, price, duration_days, max_bots, features, is_active } = req.body;
+  const id = name.toLowerCase().replace(/[^a-z0-9]/g, '_');
+  plans[id] = {
+    id,
+    name,
+    price,
+    duration_days,
+    max_bots,
+    features,
+    is_active: is_active !== undefined ? is_active : true
+  };
   res.json({ success: true });
 });
 
-app.post('/admin/update-plan', async (req, res) => {
+app.post('/admin/update-plan', (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { id, name, price, duration_days, max_bots, features, is_active } = req.body;
-  await pool.query(
-    'UPDATE plans SET name=$1, price=$2, duration_days=$3, max_bots=$4, features=$5, is_active=$6 WHERE id=$7',
-    [name, price, duration_days, max_bots, features, is_active, id]
-  );
+  if (!plans[id]) return res.status(404).json({ error: 'Plan not found' });
+  plans[id] = { ...plans[id], name, price, duration_days, max_bots, features, is_active };
   res.json({ success: true });
 });
 
-app.post('/admin/delete-plan', async (req, res) => {
+app.post('/admin/delete-plan', (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  await pool.query('DELETE FROM plans WHERE id = $1', [req.body.id]);
+  const { id } = req.body;
+  delete plans[id];
   res.json({ success: true });
 });
 
-app.post('/admin/announcements', async (req, res) => {
+app.post('/admin/announcements', (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  const { rows } = await pool.query('SELECT * FROM announcements ORDER BY priority ASC, created_at DESC');
-  res.json({ announcements: rows });
+  const annArray = Object.values(announcements).map(a => ({ ...a, id: a.id }));
+  annArray.sort((a, b) => (a.priority || 1) - (b.priority || 1));
+  res.json({ announcements: annArray });
 });
 
-app.post('/admin/create-announcement', async (req, res) => {
+app.post('/admin/create-announcement', (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { title, content, priority, active } = req.body;
-  await pool.query(
-    'INSERT INTO announcements (title, content, priority, active) VALUES ($1, $2, $3, $4)',
-    [title, content, priority || 1, active !== undefined ? active : true]
-  );
+  const id = `ann_${Date.now()}`;
+  announcements[id] = {
+    id,
+    title,
+    content,
+    priority: priority || 1,
+    active: active !== undefined ? active : true,
+    created_at: Date.now()
+  };
   res.json({ success: true });
 });
 
-app.post('/admin/update-announcement', async (req, res) => {
+app.post('/admin/update-announcement', (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
   const { id, title, content, priority, active } = req.body;
-  await pool.query(
-    'UPDATE announcements SET title=$1, content=$2, priority=$3, active=$4 WHERE id=$5',
-    [title, content, priority, active, id]
-  );
+  if (!announcements[id]) return res.status(404).json({ error: 'Announcement not found' });
+  announcements[id] = { ...announcements[id], title, content, priority, active };
   res.json({ success: true });
 });
 
-app.post('/admin/delete-announcement', async (req, res) => {
+app.post('/admin/delete-announcement', (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  await pool.query('DELETE FROM announcements WHERE id = $1', [req.body.id]);
+  const { id } = req.body;
+  delete announcements[id];
   res.json({ success: true });
 });
 
-app.post('/get-all-apps', async (req, res) => {
+app.post('/get-all-apps', (req, res) => {
   if (req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
-  const { rows } = await pool.query('SELECT * FROM bots ORDER BY created_at DESC');
-  res.json({ apps: rows });
+  const botsArray = Object.values(bots).map(b => ({ ...b, app_name: b.app_name }));
+  botsArray.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+  res.json({ apps: botsArray });
 });
 
 app.post('/delete-multiple-apps', async (req, res) => {
@@ -532,11 +503,11 @@ app.post('/delete-multiple-apps', async (req, res) => {
   const results = { success: [], failed: [] };
   for (const { name } of apps) {
     try {
-      const bot = await pool.query('SELECT heroku_app_name FROM bots WHERE app_name = $1', [name]);
-      if (bot.rows.length) {
-        await deleteHerokuApp(bot.rows[0].heroku_app_name);
+      const bot = bots[name];
+      if (bot && bot.heroku_app_name) {
+        await deleteHerokuApp(bot.heroku_app_name);
       }
-      await pool.query('DELETE FROM bots WHERE app_name = $1', [name]);
+      delete bots[name];
       results.success.push(name);
     } catch (err) {
       results.failed.push(name);
